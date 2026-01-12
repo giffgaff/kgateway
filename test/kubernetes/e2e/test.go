@@ -153,7 +153,7 @@ func (i *TestInstallation) InstallKgatewayCRDsFromLocalChart(ctx context.Context
 	}
 
 	// install the CRD chart first
-	crdChartURI, err := helper.GetLocalChartPath(helmutils.CRDChartName)
+	crdChartURI, err := helper.GetLocalChartPath(helmutils.CRDChartName, "")
 	i.Assertions.Require.NoError(err)
 	err = i.Actions.Helm().WithReceiver(os.Stdout).Upgrade(
 		ctx,
@@ -172,7 +172,7 @@ func (i *TestInstallation) InstallKgatewayCoreFromLocalChart(ctx context.Context
 	}
 
 	// and then install the main chart
-	chartUri, err := helper.GetLocalChartPath(helmutils.ChartName)
+	chartUri, err := helper.GetLocalChartPath(helmutils.ChartName, "")
 	i.Assertions.Require.NoError(err)
 	err = i.Actions.Helm().WithReceiver(os.Stdout).Upgrade(
 		ctx,
@@ -211,6 +211,7 @@ func (i *TestInstallation) UninstallKgatewayCore(ctx context.Context) {
 		helmutils.UninstallOpts{
 			Namespace:   i.Metadata.InstallNamespace,
 			ReleaseName: helmutils.ChartName,
+			ExtraArgs:   []string{"--wait"}, // Default timeout is 5m
 		},
 	)
 	i.Assertions.Require.NoError(err, "failed to uninstall main chart")
@@ -228,6 +229,7 @@ func (i *TestInstallation) UninstallKgatewayCRDs(ctx context.Context) {
 		helmutils.UninstallOpts{
 			Namespace:   i.Metadata.InstallNamespace,
 			ReleaseName: helmutils.CRDChartName,
+			ExtraArgs:   []string{"--wait"}, // Default timeout is 5m
 		},
 	)
 	i.Assertions.Require.NoError(err, "failed to uninstall CRD chart")
@@ -252,7 +254,7 @@ func (i *TestInstallation) PreFailHandler(ctx context.Context) {
 	i.Assertions.Require.NoError(err)
 
 	// Dump the logs and state of the cluster
-	helpers.StandardKgatewayDumpOnFail(os.Stdout, failureDir, namespaces)()
+	helpers.StandardKgatewayDumpOnFail(os.Stdout, i.Actions.Kubectl(), failureDir, namespaces)()
 }
 
 // GeneratedFiles is a collection of files that are generated during the execution of a set of tests
@@ -260,7 +262,7 @@ type GeneratedFiles struct {
 	// TempDir is the directory where any temporary files should be created
 	// Tests may create files for any number of reasons:
 	// - A: When a test renders objects in a file, and then uses this file to create and delete values
-	// - B: When a test invokes a command that produces a file as a side effect (glooctl, for example)
+	// - B: When a test invokes a command that produces a file as a side effect
 	// Files in this directory are an implementation detail of the test itself.
 	// As a result, it is the callers responsibility to clean up the TempDir when the tests complete
 	TempDir string

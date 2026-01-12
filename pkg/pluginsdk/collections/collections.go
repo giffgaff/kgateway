@@ -3,7 +3,6 @@ package collections
 import (
 	"context"
 
-	"github.com/go-logr/logr"
 	"istio.io/istio/pkg/config/schema/gvr"
 	"istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/kube/kclient"
@@ -15,12 +14,12 @@ import (
 
 	gwv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 
-	extensionsplug "github.com/kgateway-dev/kgateway/v2/internal/kgateway/extensions2/plugin"
+	apisettings "github.com/kgateway-dev/kgateway/v2/api/settings"
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/krtcollections"
 	"github.com/kgateway-dev/kgateway/v2/pkg/client/clientset/versioned"
+	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk"
 	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/ir"
 	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/krtutil"
-	"github.com/kgateway-dev/kgateway/v2/pkg/settings"
 
 	networkingclient "istio.io/client-go/pkg/apis/networking/v1"
 )
@@ -41,14 +40,17 @@ type CommonCollections struct {
 	Services          krt.Collection[*corev1.Service]
 	ServiceEntries    krt.Collection[*networkingclient.ServiceEntry]
 
-	Pods       krt.Collection[krtcollections.LocalityPod]
-	RefGrants  *krtcollections.RefGrantIndex
-	ConfigMaps krt.Collection[*corev1.ConfigMap]
+	WrappedPods  krt.Collection[krtcollections.WrappedPod]
+	LocalityPods krt.Collection[krtcollections.LocalityPod]
+	RefGrants    *krtcollections.RefGrantIndex
+	ConfigMaps   krt.Collection[*corev1.ConfigMap]
+
+	DiscoveryNamespacesFilter kubetypes.DynamicObjectFilter
 
 	// static set of global Settings, non-krt based for dev speed
 	// TODO: this should be refactored to a more correct location,
 	// or even better, be removed entirely and done per Gateway (maybe in GwParams)
-	Settings       settings.Settings
+	Settings       apisettings.Settings
 	ControllerName string
 }
 
@@ -58,7 +60,8 @@ func (c *CommonCollections) HasSynced() bool {
 	return c.Secrets != nil && c.Secrets.HasSynced() &&
 		c.BackendIndex != nil && c.BackendIndex.HasSynced() &&
 		c.Routes != nil && c.Routes.HasSynced() &&
-		c.Pods != nil && c.Pods.HasSynced() &&
+		c.WrappedPods != nil && c.WrappedPods.HasSynced() &&
+		c.LocalityPods != nil && c.LocalityPods.HasSynced() &&
 		c.RefGrants != nil && c.RefGrants.HasSynced() &&
 		c.ConfigMaps != nil && c.ConfigMaps.HasSynced() &&
 		c.GatewayExtensions != nil && c.GatewayExtensions.HasSynced() &&
@@ -77,8 +80,7 @@ func NewCommonCollections(
 	ourClient versioned.Interface,
 	cl client.Client,
 	controllerName string,
-	logger logr.Logger,
-	settings settings.Settings,
+	settings apisettings.Settings,
 ) (*CommonCollections, error) {
 	// Namespace collection must be initialized first to enable discovery namespace
 	// selectors to be applies as filters to other collections
@@ -139,13 +141,16 @@ func NewCommonCollections(
 
 	gwExts := krtcollections.NewGatewayExtensionsCollection(ctx, client, ourClient, krtOptions)
 
+	localityPods, wrappedPods := krtcollections.NewPodsCollection(client, krtOptions)
+
 	return &CommonCollections{
 		OurClient:         ourClient,
 		Client:            client,
 		CrudClient:        cl,
 		KrtOpts:           krtOptions,
 		Secrets:           krtcollections.NewSecretIndex(secrets, refgrants),
-		Pods:              krtcollections.NewPodsCollection(client, krtOptions),
+		LocalityPods:      localityPods,
+		WrappedPods:       wrappedPods,
 		RefGrants:         refgrants,
 		Settings:          settings,
 		Namespaces:        namespaces,
@@ -153,6 +158,8 @@ func NewCommonCollections(
 		ServiceEntries:    serviceEntries,
 		ConfigMaps:        cfgmaps,
 		GatewayExtensions: gwExts,
+
+		DiscoveryNamespacesFilter: discoveryNamespacesFilter,
 
 		ControllerName: controllerName,
 	}, nil
@@ -163,8 +170,8 @@ func NewCommonCollections(
 // of plugins themselves rely on a reference to CommonCollections.
 func (c *CommonCollections) InitPlugins(
 	ctx context.Context,
-	mergedPlugins extensionsplug.Plugin,
-	globalSettings settings.Settings,
+	mergedPlugins pluginsdk.Plugin,
+	globalSettings apisettings.Settings,
 ) {
 	gateways, routeIndex, backendIndex, endpointIRs := krtcollections.InitCollections(
 		ctx,

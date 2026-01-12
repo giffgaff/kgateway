@@ -7,27 +7,27 @@ import (
 	"github.com/kgateway-dev/kgateway/v2/api/v1alpha1"
 )
 
-func DeepMergeGatewayParameters(dst, src *v1alpha1.GatewayParameters) *v1alpha1.GatewayParameters {
+func DeepMergeGatewayParameters(dst, src *v1alpha1.GatewayParameters) {
 	if src != nil && src.Spec.SelfManaged != nil {
 		// The src override specifies a self-managed gateway, set this on the dst
 		// and skip merging of kube fields that are irrelevant because of using
 		// a self-managed gateway
 		dst.Spec.SelfManaged = src.Spec.SelfManaged
 		dst.Spec.Kube = nil
-		return dst
+		return
 	}
 
 	// nil src override means just use dst
 	if src == nil || src.Spec.Kube == nil {
-		return dst
+		return
 	}
 
 	if dst == nil || dst.Spec.Kube == nil {
-		return src
+		return
 	}
 
 	dstKube := dst.Spec.Kube
-	srcKube := src.Spec.Kube
+	srcKube := src.Spec.Kube.DeepCopy()
 
 	dstKube.Deployment = deepMergeDeployment(dstKube.GetDeployment(), srcKube.GetDeployment())
 	dstKube.EnvoyContainer = deepMergeEnvoyContainer(dstKube.GetEnvoyContainer(), srcKube.GetEnvoyContainer())
@@ -39,9 +39,8 @@ func DeepMergeGatewayParameters(dst, src *v1alpha1.GatewayParameters) *v1alpha1.
 	dstKube.Stats = deepMergeStatsConfig(dstKube.GetStats(), srcKube.GetStats())
 	dstKube.AiExtension = deepMergeAIExtension(dstKube.GetAiExtension(), srcKube.GetAiExtension())
 	dstKube.FloatingUserId = MergePointers(dstKube.GetFloatingUserId(), srcKube.GetFloatingUserId())
-	dstKube.AgentGateway = deepMergeAgentGateway(dstKube.GetAgentGateway(), srcKube.GetAgentGateway())
-
-	return dst
+	dstKube.OmitDefaultSecurityContext = MergePointers(dstKube.GetOmitDefaultSecurityContext(), srcKube.GetOmitDefaultSecurityContext())
+	dstKube.Agentgateway = deepMergeAgentgateway(dstKube.GetAgentgateway(), srcKube.GetAgentgateway())
 }
 
 // MergePointers will decide whether to use dst or src without dereferencing or recursing
@@ -140,12 +139,15 @@ func deepMergePodTemplate(dst, src *v1alpha1.Pod) *v1alpha1.Pod {
 	dst.SecurityContext = deepMergePodSecurityContext(dst.GetSecurityContext(), src.GetSecurityContext())
 	dst.ImagePullSecrets = DeepMergeSlices(dst.GetImagePullSecrets(), src.GetImagePullSecrets())
 	dst.NodeSelector = DeepMergeMaps(dst.GetNodeSelector(), src.GetNodeSelector())
-	dst.Affinity = deepMergeAffinity(dst.GetAffinity(), src.GetAffinity())
+	dst.Affinity = DeepMergeAffinity(dst.GetAffinity(), src.GetAffinity())
 	dst.Tolerations = DeepMergeSlices(dst.GetTolerations(), src.GetTolerations())
 	dst.GracefulShutdown = deepMergeGracefulShutdown(dst.GetGracefulShutdown(), src.GetGracefulShutdown())
 	dst.TerminationGracePeriodSeconds = MergePointers(dst.TerminationGracePeriodSeconds, src.TerminationGracePeriodSeconds)
+	dst.StartupProbe = deepMergeProbe(dst.GetStartupProbe(), src.GetStartupProbe())
 	dst.ReadinessProbe = deepMergeProbe(dst.GetReadinessProbe(), src.GetReadinessProbe())
 	dst.LivenessProbe = deepMergeProbe(dst.GetLivenessProbe(), src.GetLivenessProbe())
+	dst.TopologySpreadConstraints = DeepMergeSlices(dst.GetTopologySpreadConstraints(), src.GetTopologySpreadConstraints())
+	dst.ExtraVolumes = DeepMergeSlices(dst.GetExtraVolumes(), src.GetExtraVolumes())
 
 	return dst
 }
@@ -226,7 +228,7 @@ func deepMergeSeccompProfile(dst, src *corev1.SeccompProfile) *corev1.SeccompPro
 	return dst
 }
 
-func deepMergeAffinity(dst, src *corev1.Affinity) *corev1.Affinity {
+func DeepMergeAffinity(dst, src *corev1.Affinity) *corev1.Affinity {
 	// nil src override means just use dst
 	if src == nil {
 		return dst
@@ -328,6 +330,19 @@ func deepMergeProbe(dst, src *corev1.Probe) *corev1.Probe {
 }
 
 func deepMergeProbeHandler(dst, src corev1.ProbeHandler) corev1.ProbeHandler {
+	srcHasExecAction := src.Exec != nil
+	srcHasHTTPGetAction := src.HTTPGet != nil
+	srcHasTCPSocketAction := src.TCPSocket != nil
+	srcHasGRPCAction := src.GRPC != nil
+	srcHasAction := srcHasExecAction || srcHasHTTPGetAction || srcHasTCPSocketAction || srcHasGRPCAction
+	if srcHasAction {
+		// Reset the dest so it does not conflict with the src Action as there should only be one Action defined per probe
+		dst.Exec = nil
+		dst.HTTPGet = nil
+		dst.TCPSocket = nil
+		dst.GRPC = nil
+	}
+	// kube-builder validation ensures that the src has only one action
 	dst.Exec = deepMergeExecAction(dst.Exec, src.Exec)
 	dst.HTTPGet = deepMergeHTTPGetAction(dst.HTTPGet, src.HTTPGet)
 	dst.TCPSocket = deepMergeTCPSocketAction(dst.TCPSocket, src.TCPSocket)
@@ -445,6 +460,9 @@ func deepMergeService(dst, src *v1alpha1.Service) *v1alpha1.Service {
 	dst.ExtraLabels = DeepMergeMaps(dst.GetExtraLabels(), src.GetExtraLabels())
 	dst.ExtraAnnotations = DeepMergeMaps(dst.GetExtraAnnotations(), src.GetExtraAnnotations())
 	dst.Ports = DeepMergeSlices(dst.GetPorts(), src.GetPorts())
+	if src.GetExternalTrafficPolicy() != nil {
+		dst.ExternalTrafficPolicy = src.GetExternalTrafficPolicy()
+	}
 
 	return dst
 }
@@ -475,8 +493,8 @@ func deepMergeSdsContainer(dst, src *v1alpha1.SdsContainer) *v1alpha1.SdsContain
 		return src
 	}
 
-	dst.Image = deepMergeImage(dst.GetImage(), src.GetImage())
-	dst.SecurityContext = deepMergeSecurityContext(dst.GetSecurityContext(), src.GetSecurityContext())
+	dst.Image = DeepMergeImage(dst.GetImage(), src.GetImage())
+	dst.SecurityContext = DeepMergeSecurityContext(dst.GetSecurityContext(), src.GetSecurityContext())
 	dst.Resources = DeepMergeResourceRequirements(dst.GetResources(), src.GetResources())
 	dst.Bootstrap = deepMergeSdsBootstrap(dst.GetBootstrap(), src.GetBootstrap())
 
@@ -536,8 +554,8 @@ func deepMergeIstioContainer(dst, src *v1alpha1.IstioContainer) *v1alpha1.IstioC
 		return src
 	}
 
-	dst.Image = deepMergeImage(dst.GetImage(), src.GetImage())
-	dst.SecurityContext = deepMergeSecurityContext(dst.GetSecurityContext(), src.GetSecurityContext())
+	dst.Image = DeepMergeImage(dst.GetImage(), src.GetImage())
+	dst.SecurityContext = DeepMergeSecurityContext(dst.GetSecurityContext(), src.GetSecurityContext())
 	dst.Resources = DeepMergeResourceRequirements(dst.GetResources(), src.GetResources())
 
 	if src.GetLogLevel() != nil {
@@ -570,15 +588,16 @@ func deepMergeEnvoyContainer(dst, src *v1alpha1.EnvoyContainer) *v1alpha1.EnvoyC
 	}
 
 	dst.Bootstrap = deepMergeEnvoyBootstrap(dst.GetBootstrap(), src.GetBootstrap())
-	dst.Image = deepMergeImage(dst.GetImage(), src.GetImage())
-	dst.SecurityContext = deepMergeSecurityContext(dst.GetSecurityContext(), src.GetSecurityContext())
+	dst.Image = DeepMergeImage(dst.GetImage(), src.GetImage())
+	dst.SecurityContext = DeepMergeSecurityContext(dst.GetSecurityContext(), src.GetSecurityContext())
 	dst.Resources = DeepMergeResourceRequirements(dst.GetResources(), src.GetResources())
 	dst.Env = DeepMergeSlices(dst.GetEnv(), src.GetEnv())
+	dst.ExtraVolumeMounts = DeepMergeSlices(dst.ExtraVolumeMounts, src.ExtraVolumeMounts)
 
 	return dst
 }
 
-func deepMergeImage(dst, src *v1alpha1.Image) *v1alpha1.Image {
+func DeepMergeImage(dst, src *v1alpha1.Image) *v1alpha1.Image {
 	// nil src override means just use dst
 	if src == nil {
 		return dst
@@ -645,7 +664,7 @@ func DeepMergeResourceRequirements(dst, src *corev1.ResourceRequirements) *corev
 	return dst
 }
 
-func deepMergeSecurityContext(dst, src *corev1.SecurityContext) *corev1.SecurityContext {
+func DeepMergeSecurityContext(dst, src *corev1.SecurityContext) *corev1.SecurityContext {
 	// nil src override means just use dst
 	if src == nil {
 		return dst
@@ -697,6 +716,7 @@ func deepMergeDeployment(dst, src *v1alpha1.ProxyDeployment) *v1alpha1.ProxyDepl
 	}
 
 	dst.Replicas = MergePointers(dst.GetReplicas(), src.GetReplicas())
+	dst.Strategy = MergePointers(dst.Strategy, src.Strategy)
 
 	return dst
 }
@@ -712,8 +732,8 @@ func deepMergeAIExtension(dst, src *v1alpha1.AiExtension) *v1alpha1.AiExtension 
 	}
 
 	dst.Enabled = MergePointers(dst.GetEnabled(), src.GetEnabled())
-	dst.Image = deepMergeImage(dst.GetImage(), src.GetImage())
-	dst.SecurityContext = deepMergeSecurityContext(dst.GetSecurityContext(), src.GetSecurityContext())
+	dst.Image = DeepMergeImage(dst.GetImage(), src.GetImage())
+	dst.SecurityContext = DeepMergeSecurityContext(dst.GetSecurityContext(), src.GetSecurityContext())
 	dst.Resources = DeepMergeResourceRequirements(dst.GetResources(), src.GetResources())
 	dst.Env = DeepMergeSlices(dst.GetEnv(), src.GetEnv())
 	dst.Ports = DeepMergeSlices(dst.GetPorts(), src.GetPorts())
@@ -734,7 +754,6 @@ func deepMergeAIExtensionTracing(dst, src *v1alpha1.AiExtensionTrace) *v1alpha1.
 	dst.Sampler = MergePointers(dst.Sampler, src.Sampler)
 	dst.Timeout = MergePointers(dst.Timeout, src.Timeout)
 	dst.Protocol = MergePointers(dst.Protocol, src.Protocol)
-	dst.TransportSecurity = MergePointers(dst.TransportSecurity, src.TransportSecurity)
 	return dst
 }
 
@@ -753,7 +772,7 @@ func deepMergeAIExtensionStats(dst, src *v1alpha1.AiExtensionStats) *v1alpha1.Ai
 	return dst
 }
 
-func deepMergeAgentGateway(dst, src *v1alpha1.AgentGateway) *v1alpha1.AgentGateway {
+func deepMergeAgentgateway(dst, src *v1alpha1.Agentgateway) *v1alpha1.Agentgateway {
 	// nil src override means just use dst
 	if src == nil {
 		return dst
@@ -765,10 +784,12 @@ func deepMergeAgentGateway(dst, src *v1alpha1.AgentGateway) *v1alpha1.AgentGatew
 
 	dst.Enabled = MergePointers(dst.GetEnabled(), src.GetEnabled())
 	dst.LogLevel = MergePointers(dst.GetLogLevel(), src.GetLogLevel())
-	dst.Image = deepMergeImage(dst.GetImage(), src.GetImage())
-	dst.SecurityContext = deepMergeSecurityContext(dst.GetSecurityContext(), src.GetSecurityContext())
+	dst.Image = DeepMergeImage(dst.GetImage(), src.GetImage())
+	dst.SecurityContext = DeepMergeSecurityContext(dst.GetSecurityContext(), src.GetSecurityContext())
 	dst.Resources = DeepMergeResourceRequirements(dst.GetResources(), src.GetResources())
 	dst.Env = DeepMergeSlices(dst.GetEnv(), src.GetEnv())
+	dst.CustomConfigMapName = MergePointers(dst.GetCustomConfigMapName(), src.GetCustomConfigMapName())
+	dst.ExtraVolumeMounts = DeepMergeSlices(dst.ExtraVolumeMounts, src.ExtraVolumeMounts)
 
 	return dst
 }

@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/onsi/gomega"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -50,8 +52,10 @@ func (s *testingSuite) SetupSuite() {
 
 	// include gateway manifests for the tests, so we recreate it for each test run
 	s.manifests = map[string][]string{
-		"TestHttpListenerPolicyAllFields":    {gatewayManifest, httpRouteManifest, httpListenerPolicyAllFieldsManifest},
-		"TestHttpListenerPolicyServerHeader": {gatewayManifest, httpRouteManifest, httpListenerPolicyServerHeaderManifest},
+		"TestHttpListenerPolicyAllFields":    {gatewayManifest, httpRouteManifest, allFieldsManifest},
+		"TestHttpListenerPolicyServerHeader": {gatewayManifest, httpRouteManifest, serverHeaderManifest},
+		"TestPreserveHttp1HeaderCase":        {gatewayManifest, preserveHttp1HeaderCaseManifest},
+		"TestAccessLogEmittedToStdout":       {gatewayManifest, httpRouteManifest, accessLogManifest},
 	}
 }
 
@@ -107,6 +111,19 @@ func (s *testingSuite) TestHttpListenerPolicyAllFields() {
 			StatusCode: http.StatusOK,
 			Body:       gomega.ContainSubstring("Welcome to nginx!"),
 		})
+
+	// Check the health check path is working
+	s.testInstallation.Assertions.AssertEventualCurlResponse(
+		s.ctx,
+		testdefaults.CurlPodExecOpt,
+		[]curl.Option{
+			curl.WithHost(kubeutils.ServiceFQDN(proxyService.ObjectMeta)),
+			curl.WithPath("/health_check"),
+		},
+		&matchers.HttpResponse{
+			StatusCode: http.StatusOK,
+			Body:       gomega.BeEmpty(),
+		})
 }
 
 func (s *testingSuite) TestHttpListenerPolicyServerHeader() {
@@ -128,4 +145,82 @@ func (s *testingSuite) TestHttpListenerPolicyServerHeader() {
 				"server": "nginx/1.28.0", // Should be the backend server header, not "envoy"
 			},
 		})
+}
+
+func (s *testingSuite) TestPreserveHttp1HeaderCase() {
+	// The test verifies that the HTTP1 headers are preserved as expected in the request and response
+	// The HTTPListenerPolicy ensures that the header is preserved in the request,
+	// and the BackendConfigPolicy ensures that the header is preserved in the response.
+	s.testInstallation.Assertions.EventuallyObjectsExist(s.ctx, echoService, echoDeployment)
+	s.testInstallation.Assertions.EventuallyPodsRunning(s.ctx, echoDeployment.ObjectMeta.GetNamespace(), metav1.ListOptions{
+		LabelSelector: "app=raw-header-echo",
+	})
+	s.testInstallation.Assertions.AssertEventualCurlResponse(
+		s.ctx,
+		testdefaults.CurlPodExecOpt,
+		[]curl.Option{
+			curl.WithHost(kubeutils.ServiceFQDN(proxyService.ObjectMeta)),
+			curl.WithHostHeader("example.com"),
+			curl.WithHeader("X-CaSeD-HeAdEr", "test"),
+		},
+		&matchers.HttpResponse{
+			StatusCode: http.StatusOK,
+			Body:       gomega.ContainSubstring("X-CaSeD-HeAdEr"),
+			Headers: map[string]any{
+				"ReSpOnSe-miXed-CaSe-hEaDeR": "Foo",
+			},
+		},
+	)
+}
+
+func (s *testingSuite) TestAccessLogEmittedToStdout() {
+	// First: trigger a 404 that SHOULD be logged (filter is GE 400)
+	s.testInstallation.Assertions.AssertEventualCurlResponse(
+		s.ctx,
+		testdefaults.CurlPodExecOpt,
+		[]curl.Option{
+			curl.WithHost(kubeutils.ServiceFQDN(proxyService.ObjectMeta)),
+			curl.WithHostHeader("not.example.com"), // not matched by HTTPRoute hostnames
+			curl.WithPath("/does-not-exist"),
+		},
+		&matchers.HttpResponse{StatusCode: http.StatusNotFound},
+	)
+
+	// Fetch gateway pod logs and verify the 404 access log JSON fields are present
+	pods, err := s.testInstallation.Actions.Kubectl().GetPodsInNsWithLabel(
+		s.ctx, proxyDeployment.ObjectMeta.GetNamespace(),
+		"app.kubernetes.io/name="+proxyDeployment.ObjectMeta.GetName(),
+	)
+	s.Require().NoError(err)
+	s.Require().Len(pods, 1)
+
+	s.Require().EventuallyWithT(func(c *assert.CollectT) {
+		logs, err := s.testInstallation.Actions.Kubectl().GetContainerLogs(s.ctx, proxyDeployment.ObjectMeta.GetNamespace(), pods[0])
+		s.Require().NoError(err)
+		// Check a few key fields configured in http-listener-policy-access-log.yaml jsonFormat
+		assert.Contains(c, logs, "\"method\":\"GET\"")
+		assert.Contains(c, logs, "\"protocol\":\"HTTP/1.1\"")
+		assert.Contains(c, logs, "\"response_code\":404")
+		assert.Contains(c, logs, "\"path\":\"/does-not-exist\"")
+	}, 30*time.Second, 200*time.Millisecond)
+
+	// Second: trigger a 200 that SHOULD NOT be logged due to filter GE 400
+	s.testInstallation.Assertions.AssertEventualCurlResponse(
+		s.ctx,
+		testdefaults.CurlPodExecOpt,
+		[]curl.Option{
+			curl.WithHost(kubeutils.ServiceFQDN(proxyService.ObjectMeta)),
+			curl.WithHostHeader("example.com"),
+			curl.WithPath("/"),
+		},
+		&matchers.HttpResponse{StatusCode: http.StatusOK},
+	)
+
+	// Confirm 200 logs do not appear over a stability window as it isn't being immediately emitted
+	g := gomega.NewWithT(s.T())
+	g.Consistently(func() string {
+		out, err := s.testInstallation.Actions.Kubectl().GetContainerLogs(s.ctx, proxyDeployment.ObjectMeta.GetNamespace(), pods[0])
+		s.Require().NoError(err)
+		return out
+	}, 10*time.Second, 200*time.Millisecond).ShouldNot(gomega.ContainSubstring("\"response_code\":200"))
 }

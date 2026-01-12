@@ -31,16 +31,17 @@ type (
 	ProxyTranslationPass              = ir.ProxyTranslationPass
 	UnimplementedProxyTranslationPass = ir.UnimplementedProxyTranslationPass
 
-	Gateway             = ir.Gateway
-	ListenerSet         = ir.ListenerSet
-	HcmContext          = ir.HcmContext
-	HttpBackend         = ir.HttpBackend
-	HttpRouteIR         = ir.HttpRouteIR
-	Route               = ir.Route
-	RouteBackendContext = ir.RouteBackendContext
-	RouteContext        = ir.RouteContext
-	Secret              = ir.Secret
-	VirtualHostContext  = ir.VirtualHostContext
+	Gateway                  = ir.Gateway
+	ListenerSet              = ir.ListenerSet
+	HcmContext               = ir.HcmContext
+	HttpBackend              = ir.HttpBackend
+	HttpRouteIR              = ir.HttpRouteIR
+	Route                    = ir.Route
+	RouteBackendContext      = ir.RouteBackendContext
+	RouteContext             = ir.RouteContext
+	AgentgatewayRouteContext = ir.AgentgatewayRouteContext
+	Secret                   = ir.Secret
+	VirtualHostContext       = ir.VirtualHostContext
 
 	EndpointMetadata  = ir.EndpointMetadata
 	FilterChainCommon = ir.FilterChainCommon
@@ -66,11 +67,11 @@ type (
 )
 
 var (
-	HTTP2AppProtocol                      = ir.HTTP2AppProtocol
-	NewEndpointsForBackend                = ir.NewEndpointsForBackend
-	BackendResourceName                   = ir.BackendResourceName
-	NewUniqlyConnectedClient              = ir.NewUniqlyConnectedClient
-	WithDelegationInheritedPolicyPriority = ir.WithDelegationInheritedPolicyPriority
-	ErrNotAttachable                      = ir.ErrNotAttachable
-	ParseAppProtocol                      = ir.ParseAppProtocol
+	HTTP2AppProtocol            = ir.HTTP2AppProtocol
+	NewEndpointsForBackend      = ir.NewEndpointsForBackend
+	BackendResourceName         = ir.BackendResourceName
+	NewUniqlyConnectedClient    = ir.NewUniqlyConnectedClient
+	WithInheritedPolicyPriority = ir.WithInheritedPolicyPriority
+	ErrNotAttachable            = ir.ErrNotAttachable
+	ParseAppProtocol            = ir.ParseAppProtocol
 )

@@ -9,10 +9,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"knative.dev/pkg/network"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	v3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	envoycorev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 
 	networkingv1beta1 "istio.io/api/networking/v1beta1"
 	networkingclient "istio.io/client-go/pkg/apis/networking/v1"
@@ -24,6 +23,7 @@ import (
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/extensions2/plugins/serviceentry"
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/ir"
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/wellknown"
+	"github.com/kgateway-dev/kgateway/v2/pkg/utils/kubeutils"
 	"github.com/kgateway-dev/kgateway/v2/pkg/utils/stringutils"
 )
 
@@ -45,7 +45,20 @@ type Service struct {
 // including those from aliases.
 // Specifically returns the aliases _first_.
 func (s Service) Keys() []ir.ObjectSource {
-	return append(s.Aliases, ir.ObjectSource{
+	aliases := s.Aliases
+
+	// Check if the first alias is a ServiceEntry's own ObjectSource
+	if len(aliases) > 0 && aliases[0].Equals(ir.ObjectSource{
+		Name:      s.GetName(),
+		Namespace: s.GetNamespace(),
+		Group:     wellknown.ServiceEntryGVK.Group,
+		Kind:      wellknown.ServiceEntryGVK.Kind,
+	}) {
+		// ServiceEntry has self as the first one (see BuildServiceEntryBackendObjectIR).
+		// We want to return the aliases _after_ the self.
+		aliases = aliases[1:]
+	}
+	return append(aliases, ir.ObjectSource{
 		Name:      s.GetName(),
 		Namespace: s.GetNamespace(),
 		Group:     s.GroupKind.Group,
@@ -82,7 +95,7 @@ func (s Service) DefaultVHostName(port ServicePort) string {
 }
 
 func (s Service) BackendRef(port ServicePort) ir.BackendRefIR {
-	backendObj := s.BackendObject(uint32(port.Port))
+	backendObj := s.BackendObject(uint32(port.Port)) //nolint:gosec // G115: service port is int32, always in valid range
 	return ir.BackendRefIR{
 		ClusterName:   backendObj.ClusterName(),
 		Weight:        0,
@@ -108,7 +121,7 @@ func (s Service) BackendObject(port uint32) ir.BackendObjectIR {
 
 	protocol := ""
 	for _, v := range s.Ports {
-		if v.Port == int32(port) {
+		if v.Port == int32(port) { //nolint:gosec // G115: port is uint32 representing a port number, safe to convert to int32
 			protocol = v.Protocol
 			break
 		}
@@ -119,12 +132,12 @@ func (s Service) BackendObject(port uint32) ir.BackendObjectIR {
 		return serviceentry.BuildServiceEntryBackendObjectIR(
 			obj,
 			hostname,
-			int32(port),
+			int32(port), //nolint:gosec // G115: port is uint32 representing a port number, safe to convert to int32
 			protocol,
 			nil, // we just need the cluster name, aliases not important here
 		)
 	case *corev1.Service:
-		return kubernetes.BuildServiceBackendObjectIR(obj, int32(port), protocol)
+		return kubernetes.BuildServiceBackendObjectIR(obj, int32(port), protocol) //nolint:gosec // G115: port is uint32 representing a port number, safe to convert to int32
 	}
 
 	// fallback: assume k8s
@@ -135,7 +148,7 @@ func (s Service) BackendObject(port uint32) ir.BackendObjectIR {
 			Namespace: s.GetNamespace(),
 			Name:      s.GetName(),
 		},
-		Port:              int32(port),
+		Port:              int32(port), //nolint:gosec // G115: port is uint32 representing a port number, safe to convert to int32
 		GvPrefix:          kubernetes.BackendClusterPrefix,
 		CanonicalHostname: hostname,
 		Obj:               s.Object,
@@ -167,7 +180,7 @@ func (s Service) Provider() provider.ID {
 // but those cases should already get rejected by Kubernetes or Istio validation.
 var ErrNoServiceVIPs = errors.New("service has no valid VIPs")
 
-func (svc *Service) CidrRanges() ([]*v3.CidrRange, error) {
+func (svc *Service) CidrRanges() ([]*envoycorev3.CidrRange, error) {
 	// TODO support headless by passing dest hostname on TLVs and
 	// using that as a filter chain matcher
 	cidrRanges := ipsToCidrRanges(svc.Addresses)
@@ -179,15 +192,15 @@ func (svc *Service) CidrRanges() ([]*v3.CidrRange, error) {
 
 // ipsToCidrRanges maps a list of strings that can be IPs (1.2.3.4) or cidrs (1.2.3.4/32)
 // to CidrRange, picking the correct prefix length for single IPv4 or IPv6 addresses.
-func ipsToCidrRanges(ips []string) []*v3.CidrRange {
-	var clusterIPs []*v3.CidrRange
+func ipsToCidrRanges(ips []string) []*envoycorev3.CidrRange {
+	var clusterIPs []*envoycorev3.CidrRange
 	for _, addr := range ips {
 		cidrRange, err := istioutil.AddrStrToCidrRange(addr)
 		if err != nil {
 			// this should never happen as either Kubernetes or Istio validation prevents it.
 			continue
 		}
-		clusterIPs = append(clusterIPs, &v3.CidrRange{
+		clusterIPs = append(clusterIPs, &envoycorev3.CidrRange{
 			AddressPrefix: cidrRange.GetAddressPrefix(),
 			PrefixLen:     cidrRange.GetPrefixLen(),
 		})
@@ -219,8 +232,7 @@ func (sp ServicePort) IsHTTP() bool {
 }
 
 func fqdn(name, ns string) string {
-	// TODO: reevaluate knative dep, dedupe with pkg/utils/kubeutils/dns.go
-	clusterDomain := network.GetClusterDomainName()
+	clusterDomain := kubeutils.GetClusterDomainName()
 	return fmt.Sprintf("%s.%s.svc.%s", name, ns, clusterDomain)
 }
 
@@ -243,7 +255,7 @@ func FromService(svc *corev1.Service) Service {
 				Port:       int32(p.Port),
 				Protocol:   protocol,
 				Name:       p.Name,
-				TargetPort: int32(p.TargetPort.IntValue()),
+				TargetPort: int32(p.TargetPort.IntValue()), //nolint:gosec // G115: Kubernetes target port is int, safe to convert to int32
 			}
 		}),
 	}
@@ -260,10 +272,10 @@ func FromServiceEntry(se *networkingclient.ServiceEntry, aliases []ir.ObjectSour
 		Hostnames: se.Spec.GetHosts(),
 		Ports: slices.Map(se.Spec.GetPorts(), func(p *networkingv1beta1.ServicePort) ServicePort {
 			return ServicePort{
-				Port:       int32(p.Number),
+				Port:       int32(p.Number), //nolint:gosec // G115: ServiceEntry port number is uint32, safe to convert to int32
 				Protocol:   string(p.Protocol),
 				Name:       p.Name,
-				TargetPort: int32(p.TargetPort),
+				TargetPort: int32(p.TargetPort), //nolint:gosec // G115: ServiceEntry target port is uint32, safe to convert to int32
 			}
 		}),
 	}
@@ -334,7 +346,7 @@ type Workload struct {
 func (w Workload) PortMapping(port ServicePort) int32 {
 	if w.ports != nil {
 		if p, ok := w.ports[port.Name]; ok {
-			return int32(p)
+			return int32(p) //nolint:gosec // G115: workload port is uint32, safe to convert to int32
 		}
 	}
 	if port.TargetPort != 0 {

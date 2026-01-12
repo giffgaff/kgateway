@@ -27,7 +27,7 @@ type tsuite struct {
 
 	ctx context.Context
 	// ti contains all the metadata/utilities necessary to execute a series of tests
-	// against an installation of Gloo Gateway
+	// against an installation of kgateway
 	ti *e2e.TestInstallation
 
 	// maps test name to a list of manifests to apply before the test
@@ -60,7 +60,7 @@ func (s *tsuite) SetupSuite() {
 	s.ti.Assertions.EventuallyPodsRunning(s.ctx, defaults.CurlPod.Namespace, metav1.ListOptions{
 		LabelSelector: defaults.CurlPodLabelSelector,
 	})
-	s.ti.Assertions.EventuallyPodsRunning(s.ctx, defaults.HttpbinPod.Namespace, metav1.ListOptions{
+	s.ti.Assertions.EventuallyPodsRunning(s.ctx, defaults.HttpbinDeployment.Namespace, metav1.ListOptions{
 		LabelSelector: defaults.HttpbinLabelSelector,
 	})
 	s.ti.Assertions.EventuallyPodsRunning(s.ctx, gateway.Namespace, metav1.ListOptions{
@@ -113,7 +113,7 @@ func (s *tsuite) TestLabelSelector() {
 		assert.Contains(c, logs, `"protocol":"HTTP/1.1"`)
 		assert.Contains(c, logs, `"response_code":200`)
 		assert.Contains(c, logs, `"backendCluster":"kube_default_httpbin_8000"`)
-	}, 5*time.Second, 100*time.Millisecond)
+	}, 30*time.Second, 100*time.Millisecond)
 }
 
 func (s *tsuite) TestGlobalPolicy() {

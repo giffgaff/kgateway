@@ -16,16 +16,17 @@ import (
 	"k8s.io/utils/ptr"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 
-	extensionsplug "github.com/kgateway-dev/kgateway/v2/internal/kgateway/extensions2/plugin"
+	apisettings "github.com/kgateway-dev/kgateway/v2/api/settings"
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/extensions2/plugins/sandwich"
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/extensions2/plugins/waypoint/waypointquery"
-	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/extensions2/settings"
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/ir"
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/query"
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/translator/httproute"
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/wellknown"
 	"github.com/kgateway-dev/kgateway/v2/pkg/logging"
+	sdk "github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk"
 	reports "github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/reporter"
+	"github.com/kgateway-dev/kgateway/v2/pkg/utils/cmputils"
 	"github.com/kgateway-dev/kgateway/v2/pkg/utils/stringutils"
 )
 
@@ -50,13 +51,13 @@ type waypointTranslator struct {
 	bindIpv6      bool
 }
 
-var _ extensionsplug.KGwTranslator = &waypointTranslator{}
+var _ sdk.KGwTranslator = &waypointTranslator{}
 
 func NewTranslator(
 	queries query.GatewayQueries,
 	waypointQueries waypointquery.WaypointQueries,
-	settings settings.Settings,
-) extensionsplug.KGwTranslator {
+	settings apisettings.Settings,
+) sdk.KGwTranslator {
 	return &waypointTranslator{
 		queries:         queries,
 		waypointQueries: waypointQueries,
@@ -66,7 +67,7 @@ func NewTranslator(
 	}
 }
 
-// Translate implements extensionsplug.KGwTranslator.
+// Translate implements sdk.KGwTranslator.
 func (w *waypointTranslator) Translate(
 	kctx krt.HandlerContext,
 	ctx context.Context,
@@ -156,8 +157,7 @@ func (w *waypointTranslator) buildInboundListener(gw *ir.Gateway, reporter repor
 			// if no allowed kinds, just use all of our default supportedKinds
 			supportedKinds := slices.Filter(waypointSupportedKinds, func(s gwv1.RouteGroupKind) bool {
 				return l.AllowedRoutes == nil || nil != slices.FindFunc(l.AllowedRoutes.Kinds, func(lk gwv1.RouteGroupKind) bool {
-					groupEq := (lk.Group == nil && s.Group == nil) || (lk.Group != nil && s.Group != nil && *lk.Group == *s.Group)
-					return groupEq && lk.Kind == s.Kind
+					return cmputils.PointerValsEqual(lk.Group, s.Group) && lk.Kind == s.Kind
 				})
 			})
 			reporter.Listener(&l.Listener).SetSupportedKinds(supportedKinds)
@@ -197,7 +197,7 @@ func (w *waypointTranslator) buildInboundListener(gw *ir.Gateway, reporter repor
 	return &ir.ListenerIR{
 		Name:              "proxy_protocol_inbound",
 		BindAddress:       bindAddr,
-		BindPort:          uint32(gatewayListener.Port),
+		BindPort:          uint32(gatewayListener.Port), //nolint:gosec // G115: Gateway API listener port is int32, always in valid range
 		PolicyAncestorRef: gatewayListener.PolicyAncestorRef,
 
 		AttachedPolicies: ir.AttachedPolicies{
@@ -308,7 +308,7 @@ func (t *waypointTranslator) buildServiceChains(
 		// HTTPRoutes apply at the Service level, not the port
 		// level so we don't need to generate this multiple times
 		// TODO respect `port` on parentRef
-		httpRoutesVirtualHost := t.buildHTTPVirtualHost(ctx, baseReporter, gw, gwListener, svc, httpRoutes)
+		httpRoutesVirtualHost := t.buildHTTPVirtualHost(ctx, baseReporter, gwListener, svc, httpRoutes)
 
 		for _, svcPort := range svc.Ports {
 			filterChain, err := initServiceChain(svc, svcPort)
@@ -348,7 +348,7 @@ func (t *waypointTranslator) buildServiceChains(
 				}
 
 				// Apply TCP RBAC filters to this TCP filter chain
-				applyTCPRBACFilters(&tcpChain, tcpRBAC, svc)
+				applyTCPRBACFilters(&tcpChain, tcpRBAC)
 				tcpOut = append(tcpOut, tcpChain)
 			}
 		}
@@ -379,7 +379,7 @@ func initServiceChain(
 	}
 	match := ir.FilterChainMatch{
 		PrefixRanges:    prefixRanges,
-		DestinationPort: &wrapperspb.UInt32Value{Value: uint32(port.Port)},
+		DestinationPort: &wrapperspb.UInt32Value{Value: uint32(port.Port)}, //nolint:gosec // G115: service port is int32, always in valid range
 	}
 
 	fcCommon := ir.FilterChainCommon{
@@ -395,7 +395,6 @@ func initServiceChain(
 func (t *waypointTranslator) buildHTTPVirtualHost(
 	ctx context.Context,
 	baseReporter reports.Reporter,
-	gw *ir.Gateway,
 	gwListener *ir.Listener,
 	svc waypointquery.Service,
 	httpRoutes []*query.RouteInfo,

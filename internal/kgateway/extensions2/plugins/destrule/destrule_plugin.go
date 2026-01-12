@@ -8,28 +8,28 @@ import (
 	"google.golang.org/protobuf/types/known/wrapperspb"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
-	envoy_config_cluster_v3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
-	envoy_config_core_v3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	envoyclusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+	envoycorev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	envoy_type_v3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pkg/config/schema/gvr"
 	"istio.io/istio/pkg/kube/krt"
 
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/endpoints"
-	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/extensions2/common"
-	extensionsplug "github.com/kgateway-dev/kgateway/v2/internal/kgateway/extensions2/plugin"
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/ir"
+	sdk "github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk"
+	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/collections"
 )
 
 const (
 	ExtensionName = "Destrule"
 )
 
-func NewPlugin(ctx context.Context, commoncol *common.CommonCollections) extensionsplug.Plugin {
+func NewPlugin(ctx context.Context, commoncol *collections.CommonCollections) sdk.Plugin {
 	if !commoncol.Settings.EnableIstioIntegration {
 		// TODO: should this be a standalone flag specific to DR?
 		// don't add support for destination rules if istio integration is not enabled
-		return extensionsplug.Plugin{}
+		return sdk.Plugin{}
 	}
 
 	gk := schema.GroupKind{
@@ -39,8 +39,8 @@ func NewPlugin(ctx context.Context, commoncol *common.CommonCollections) extensi
 	d := &destrulePlugin{
 		destinationRulesIndex: NewDestRuleIndex(commoncol.Client, &commoncol.KrtOpts),
 	}
-	return extensionsplug.Plugin{
-		ContributesPolicies: map[schema.GroupKind]extensionsplug.PolicyPlugin{
+	return sdk.Plugin{
+		ContributesPolicies: map[schema.GroupKind]sdk.PolicyPlugin{
 			gk: {
 				Name:                      "destrule",
 				PerClientProcessBackend:   d.processBackend,
@@ -80,20 +80,21 @@ func (d *destrulePlugin) processEndpoints(
 	return hasher.Sum64()
 }
 
-func (d *destrulePlugin) processBackend(kctx krt.HandlerContext, ctx context.Context, ucc ir.UniqlyConnectedClient, in ir.BackendObjectIR, outCluster *envoy_config_cluster_v3.Cluster) {
+func (d *destrulePlugin) processBackend(kctx krt.HandlerContext, ctx context.Context, ucc ir.UniqlyConnectedClient, in ir.BackendObjectIR, outCluster *envoyclusterv3.Cluster) {
 	destrule := d.destinationRulesIndex.FetchDestRulesFor(kctx, ucc.Namespace, in.CanonicalHostname, ucc.Labels)
 	if destrule != nil {
-		trafficPolicy := getTrafficPolicy(destrule, uint32(in.Port))
+		trafficPolicy := getTrafficPolicy(destrule, uint32(in.Port)) //nolint:gosec // G115: BackendObjectIR.Port is int32 representing a port number, always in valid range
 		if outlier := trafficPolicy.GetOutlierDetection(); outlier != nil {
 			if getLocalityLbSetting(trafficPolicy) != nil {
 				if outCluster.GetCommonLbConfig() == nil {
-					outCluster.CommonLbConfig = &envoy_config_cluster_v3.Cluster_CommonLbConfig{}
+					outCluster.CommonLbConfig = &envoyclusterv3.Cluster_CommonLbConfig{}
 				}
-				outCluster.GetCommonLbConfig().LocalityConfigSpecifier = &envoy_config_cluster_v3.Cluster_CommonLbConfig_LocalityWeightedLbConfig_{
-					LocalityWeightedLbConfig: &envoy_config_cluster_v3.Cluster_CommonLbConfig_LocalityWeightedLbConfig{},
+				outCluster.GetCommonLbConfig().LocalityConfigSpecifier = &envoyclusterv3.Cluster_CommonLbConfig_LocalityWeightedLbConfig_{
+					LocalityWeightedLbConfig: &envoyclusterv3.Cluster_CommonLbConfig_LocalityWeightedLbConfig{},
 				}
 			}
-			out := &envoy_config_cluster_v3.OutlierDetection{
+
+			out := &envoyclusterv3.OutlierDetection{
 				Consecutive_5Xx:  outlier.GetConsecutive_5XxErrors(),
 				Interval:         outlier.GetInterval(),
 				BaseEjectionTime: outlier.GetBaseEjectionTime(),
@@ -107,7 +108,7 @@ func (d *destrulePlugin) processBackend(kctx krt.HandlerContext, ctx context.Con
 				out.EnforcingConsecutiveGatewayFailure = &wrapperspb.UInt32Value{Value: v}
 			}
 			if outlier.GetMaxEjectionPercent() > 0 {
-				out.MaxEjectionPercent = &wrapperspb.UInt32Value{Value: uint32(outlier.GetMaxEjectionPercent())}
+				out.MaxEjectionPercent = &wrapperspb.UInt32Value{Value: uint32(outlier.GetMaxEjectionPercent())} //nolint:gosec // G115: MaxEjectionPercent is a percentage value (0-100), safe for uint32
 			}
 			if outlier.GetSplitExternalLocalOriginErrors() {
 				out.SplitExternalLocalOriginErrors = true
@@ -121,7 +122,7 @@ func (d *destrulePlugin) processBackend(kctx krt.HandlerContext, ctx context.Con
 			minHealthPercent := outlier.GetMinHealthPercent()
 			if minHealthPercent >= 0 {
 				if outCluster.GetCommonLbConfig() == nil {
-					outCluster.CommonLbConfig = &envoy_config_cluster_v3.Cluster_CommonLbConfig{}
+					outCluster.CommonLbConfig = &envoyclusterv3.Cluster_CommonLbConfig{}
 				}
 				outCluster.GetCommonLbConfig().HealthyPanicThreshold = &envoy_type_v3.Percent{Value: float64(minHealthPercent)}
 			}
@@ -132,19 +133,19 @@ func (d *destrulePlugin) processBackend(kctx krt.HandlerContext, ctx context.Con
 			if tcpSettings := trafficPolicy.GetConnectionPool().GetTcp(); tcpSettings != nil {
 				if tcpKeepalive := tcpSettings.GetTcpKeepalive(); tcpKeepalive != nil {
 					if outCluster.GetUpstreamConnectionOptions() == nil {
-						outCluster.UpstreamConnectionOptions = &envoy_config_cluster_v3.UpstreamConnectionOptions{}
+						outCluster.UpstreamConnectionOptions = &envoyclusterv3.UpstreamConnectionOptions{}
 					}
 					if outCluster.GetUpstreamConnectionOptions().GetTcpKeepalive() == nil {
-						outCluster.GetUpstreamConnectionOptions().TcpKeepalive = &envoy_config_core_v3.TcpKeepalive{}
+						outCluster.GetUpstreamConnectionOptions().TcpKeepalive = &envoycorev3.TcpKeepalive{}
 					}
 					if tcpKeepalive.GetTime() != nil {
-						outCluster.GetUpstreamConnectionOptions().GetTcpKeepalive().KeepaliveTime = &wrapperspb.UInt32Value{Value: uint32(tcpKeepalive.GetTime().GetSeconds())}
+						outCluster.GetUpstreamConnectionOptions().GetTcpKeepalive().KeepaliveTime = &wrapperspb.UInt32Value{Value: uint32(tcpKeepalive.GetTime().GetSeconds())} //nolint:gosec // G115: TCP keepalive time in seconds, reasonable range for uint32
 					}
 					if tcpKeepalive.GetInterval() != nil {
-						outCluster.GetUpstreamConnectionOptions().GetTcpKeepalive().KeepaliveInterval = &wrapperspb.UInt32Value{Value: uint32(tcpKeepalive.GetInterval().GetSeconds())}
+						outCluster.GetUpstreamConnectionOptions().GetTcpKeepalive().KeepaliveInterval = &wrapperspb.UInt32Value{Value: uint32(tcpKeepalive.GetInterval().GetSeconds())} //nolint:gosec // G115: TCP keepalive interval in seconds, reasonable range for uint32
 					}
 					if tcpKeepalive.GetProbes() > 0 {
-						outCluster.GetUpstreamConnectionOptions().GetTcpKeepalive().KeepaliveProbes = &wrapperspb.UInt32Value{Value: uint32(tcpKeepalive.GetProbes())}
+						outCluster.GetUpstreamConnectionOptions().GetTcpKeepalive().KeepaliveProbes = &wrapperspb.UInt32Value{Value: uint32(tcpKeepalive.GetProbes())} //nolint:gosec // G115: TCP keepalive probe count, reasonable range for uint32
 					}
 				}
 			}

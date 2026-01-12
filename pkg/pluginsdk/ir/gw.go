@@ -7,7 +7,7 @@ import (
 	"slices"
 	"strings"
 
-	envoy_config_cluster_v3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+	envoyclusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 
@@ -20,12 +20,12 @@ var VirtualBuiltInGK = schema.GroupKind{
 }
 
 type BackendInit struct {
-	// InitBackend optionally returns an `*ir.EndpointsForBackend` that can be used
+	// InitEnvoyBackend optionally returns an `*ir.EndpointsForBackend` that can be used
 	// to initialize a ClusterLoadAssignment inline on the Cluster, with proper locality
 	// based prioritization applied, as well as endpoint plugins applied.
-	// This will never override a ClusterLoadAssignment that is set inside of an InitBackend implementation.
+	// This will never override a ClusterLoadAssignment that is set inside of an InitEnvoyBackend implementation.
 	// The CLA is only added if the Cluster has a compatible type (EDS, LOGICAL_DNS, STRICT_DNS).
-	InitBackend func(ctx context.Context, in BackendObjectIR, out *envoy_config_cluster_v3.Cluster) *EndpointsForBackend
+	InitEnvoyBackend func(ctx context.Context, in BackendObjectIR, out *envoyclusterv3.Cluster) *EndpointsForBackend
 }
 
 type PolicyRef struct {
@@ -51,11 +51,12 @@ func (ref *AttachedPolicyRef) ID() string {
 }
 
 type PolicyAtt struct {
+	// GroupKind is the GK of the original policy object
+	GroupKind schema.GroupKind
+
 	// Generation of the Policy CR contributing to this attachment
 	Generation int64
 
-	// GroupKind is the GK of the original policy object
-	GroupKind schema.GroupKind
 	// original object. ideally with structural errors removed.
 	// Opaque to us other than metadata.
 	PolicyIr PolicyIR
@@ -64,20 +65,31 @@ type PolicyAtt struct {
 	// nil if the attachment was done via extension ref or if PolicyAtt is the result of MergePolicies(...)
 	PolicyRef *AttachedPolicyRef
 
-	// MergeOrigins maps field names in the PolicyIr to their original source in the merged PolicyAtt.
-	// It can be used to determine which PolicyAtt a merged field came from.
-	MergeOrigins map[string]*AttachedPolicyRef
+	// InheritedPolicyPriority is the priority of the policy when it is inherited by a child resource
+	// of the resource this policy is attached to
+	InheritedPolicyPriority apiannotations.InheritedPolicyPriorityValue
 
-	DelegationInheritedPolicyPriority apiannotations.DelegationInheritedPolicyPriorityValue
+	// Errors should be formatted for users, so do not include internal lib errors.
+	// Instead use a well defined error such as ErrInvalidConfig
+	Errors []error
 
 	// HierarchicalPriority is the priority of the policy in an inheritance hierarchy.
 	// A higher value means higher priority. It is used to accurately merge policies
 	// that are at different levels in the config tree hierarchy.
 	HierarchicalPriority int
 
-	// Errors should be formatted for users, so do not include internal lib errors.
-	// Instead use a well defined error such as ErrInvalidConfig
-	Errors []error
+	// PrecedenceWeight specifies the weight of the policy as an integer value (negative values are allowed).
+	// Policies with higher weight implies higher priority, and are evaluated before policies with lower weight.
+	// By default, policies have a weight of 0.
+	// The policy's weight is relevant to policy prioritization during policy merging, such that higher priority
+	// policies are preferred during a merge conflict or when ordering policies during a merge.
+	PrecedenceWeight int32
+
+	// MergeOrigins maps field names in the PolicyIr to their original source in the merged PolicyAtt.
+	// It can be used to determine which PolicyAtt a merged field came from.
+	// Only relevant to policy merging and does not contribute to KRT events
+	// +noKrtEquals
+	MergeOrigins MergeOrigins
 }
 
 func (c PolicyAtt) FormatErrors() string {
@@ -85,14 +97,19 @@ func (c PolicyAtt) FormatErrors() string {
 	for i, err := range c.Errors {
 		errs[i] = err.Error()
 	}
-	return strings.Join(errs, "; ")
+
+	errsStr := strings.Join(errs, "; ")
+	if c.MergeOrigins.IsSet() {
+		return "Merged policy: " + errsStr
+	}
+	return errsStr
 }
 
 type PolicyAttachmentOpts func(*PolicyAtt)
 
-func WithDelegationInheritedPolicyPriority(priority apiannotations.DelegationInheritedPolicyPriorityValue) PolicyAttachmentOpts {
+func WithInheritedPolicyPriority(priority apiannotations.InheritedPolicyPriorityValue) PolicyAttachmentOpts {
 	return func(p *PolicyAtt) {
-		p.DelegationInheritedPolicyPriority = priority
+		p.InheritedPolicyPriority = priority
 	}
 }
 
@@ -105,7 +122,29 @@ func (c PolicyAtt) TargetRef() *AttachedPolicyRef {
 }
 
 func (c PolicyAtt) Equals(in PolicyAtt) bool {
-	return c.GroupKind == in.GroupKind && ptrEquals(c.PolicyRef, in.PolicyRef) && c.PolicyIr.Equals(in.PolicyIr)
+	if !slices.EqualFunc(c.Errors, in.Errors, func(e1, e2 error) bool {
+		if e1 == nil && e2 != nil {
+			return false
+		}
+		if e1 != nil && e2 == nil {
+			return false
+		}
+		if (e1 != nil && e2 != nil) && e1.Error() != e2.Error() {
+			return false
+		}
+
+		return true
+	}) {
+		return false
+	}
+
+	return c.GroupKind == in.GroupKind &&
+		c.Generation == in.Generation &&
+		c.PolicyIr.Equals(in.PolicyIr) &&
+		ptrEquals(c.PolicyRef, in.PolicyRef) &&
+		c.InheritedPolicyPriority == in.InheritedPolicyPriority &&
+		c.HierarchicalPriority == in.HierarchicalPriority &&
+		c.PrecedenceWeight == in.PrecedenceWeight
 }
 
 func ptrEquals[T comparable](a, b *T) bool {
@@ -123,18 +162,18 @@ type AttachedPolicies struct {
 }
 
 // ApplyOrderedGroupKinds returns a list of GroupKinds sorted by their application order
-// such that subsequent policies can override previous ones.
-// Built-in policies are applied last so that they can override policies from other GroupKinds
-// since they are considered more specific than other policy attachments.
+// from highest to lowest priority.
+// Built-in policies are applied first as they are of highest priority relative to other GroupKinds
+// as they are considered more specific than other policy attachments.
 func (a AttachedPolicies) ApplyOrderedGroupKinds() []schema.GroupKind {
 	return slices.SortedStableFunc(maps.Keys(a.Policies), func(a, b schema.GroupKind) int {
 		switch {
 		case a.Group == VirtualBuiltInGK.Group:
-			// If a is builtin, it should come after b
-			return 1
-		case b.Group == VirtualBuiltInGK.Group:
-			// If b is builtin, a should come before b
+			// If a is builtin, a should come before b
 			return -1
+		case b.Group == VirtualBuiltInGK.Group:
+			// If b is builtin, a should come after b
+			return 1
 		default:
 			// neither is builtin, preserve relative order
 			return 0
@@ -175,6 +214,21 @@ func (a *AttachedPolicies) Append(l ...AttachedPolicies) {
 	}
 }
 
+// Append appends the policies in l in the given order to the policies in a.
+func (a *AttachedPolicies) AppendWithPriority(HierarchicalPriority int, l ...AttachedPolicies) {
+	if a.Policies == nil {
+		a.Policies = make(map[schema.GroupKind][]PolicyAtt)
+	}
+	for _, l := range l {
+		for k, v := range l.Policies {
+			for j := range v {
+				v[j].HierarchicalPriority = HierarchicalPriority
+			}
+			a.Policies[k] = append(a.Policies[k], v...)
+		}
+	}
+}
+
 // Prepend prepends the policies in l in the given to the policies in a.
 func (a *AttachedPolicies) Prepend(hierarchicalPriority int, l ...AttachedPolicies) {
 	if a.Policies == nil {
@@ -183,9 +237,6 @@ func (a *AttachedPolicies) Prepend(hierarchicalPriority int, l ...AttachedPolici
 	// iterate in the reverse order so that the input order in l is preserved at the end
 	for i := len(l) - 1; i >= 0; i-- {
 		for k, v := range l[i].Policies {
-			if a.Policies == nil {
-				a.Policies = make(map[schema.GroupKind][]PolicyAtt)
-			}
 			for j := range v {
 				v[j].HierarchicalPriority = hierarchicalPriority
 			}
@@ -226,4 +277,8 @@ type HttpRouteRuleIR struct {
 	Backends         []HttpBackendOrDelegate
 	Matches          []gwv1.HTTPRouteMatch
 	Name             string
+
+	// Err contains any error encountered during the construction of this HttpRouteRuleIR
+	// that should be propagated through to translation to any derived ir.HttpRouteRuleMatchIRs
+	Err error
 }

@@ -2,22 +2,17 @@ package envoyinit
 
 import (
 	"bytes"
-	"context"
 	"errors"
-	"fmt"
 	"log"
-	"log/slog"
 	"os"
 	"syscall"
-	"time"
 
-	envoy_config_bootstrap "github.com/envoyproxy/go-control-plane/envoy/config/bootstrap/v3"
-	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
-	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+	envoybootstrapv3 "github.com/envoyproxy/go-control-plane/envoy/config/bootstrap/v3"
+	envoycorev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	envoytlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 
 	"github.com/kgateway-dev/kgateway/v2/internal/envoyinit/pkg/downward"
 	"github.com/kgateway-dev/kgateway/v2/internal/envoyinit/pkg/utils"
-	"github.com/kgateway-dev/kgateway/v2/pkg/utils/cmdutils"
 	"github.com/kgateway-dev/kgateway/v2/pkg/utils/protoutils"
 )
 
@@ -35,30 +30,6 @@ const (
 	defaultEnvoyExecutable = "/usr/local/bin/envoy"
 )
 
-func RunEnvoyValidate(ctx context.Context, envoyExecutable, bootstrapConfig string) error {
-	validateCmd := cmdutils.Command(ctx, envoyExecutable, "--mode", "validate", "--config-path", "/dev/fd/0",
-		"-l", "critical", "--log-format", "%v")
-	validateCmd = validateCmd.WithStdin(bytes.NewBufferString(bootstrapConfig))
-
-	start := time.Now()
-	err := validateCmd.Run()
-	slog.Debug("envoy validation completed",
-		"size_bytes", len(bootstrapConfig),
-		"duration", time.Since(start))
-
-	if err != nil {
-		if os.IsNotExist(err) {
-			// log a warning and return nil; will allow users to continue to run Gloo locally without
-			// relying on the Gloo container with Envoy already published to the expected directory
-			slog.Warn("unable to validate envoy configuration", "executable", envoyExecutable)
-			return nil
-		}
-		return fmt.Errorf("envoy validation mode output: %v, error: %w", err.OutputString(), err)
-	}
-
-	return nil
-}
-
 // RunEnvoy run Envoy with bootstrap configuration injected from a file
 func RunEnvoy(envoyExecutable, inputPath, outputPath string) {
 	// 1. Transform the configuration using the Kubernetes Downward API
@@ -74,17 +45,17 @@ func RunEnvoy(envoyExecutable, inputPath, outputPath string) {
 	if caPath != "" {
 		log.Printf("Using OS CA certificate for proxy: %s", caPath)
 		//If the CA cert path is set, we need to set the CA cert path in the bootstrap config
-		var bootstrap envoy_config_bootstrap.Bootstrap
+		var bootstrap envoybootstrapv3.Bootstrap
 		err := protoutils.UnmarshalYaml([]byte(bootstrapConfig), &bootstrap)
 		if err != nil {
 			log.Fatalf("failed to unmarshal bootstrap config: %v", err)
 		}
-		bootstrap.GetStaticResources().Secrets = append(bootstrap.GetStaticResources().GetSecrets(), &tlsv3.Secret{
+		bootstrap.GetStaticResources().Secrets = append(bootstrap.GetStaticResources().GetSecrets(), &envoytlsv3.Secret{
 			Name: utils.SystemCaSecretName,
-			Type: &tlsv3.Secret_ValidationContext{
-				ValidationContext: &tlsv3.CertificateValidationContext{
-					TrustedCa: &corev3.DataSource{
-						Specifier: &corev3.DataSource_Filename{
+			Type: &envoytlsv3.Secret_ValidationContext{
+				ValidationContext: &envoytlsv3.CertificateValidationContext{
+					TrustedCa: &envoycorev3.DataSource{
+						Specifier: &envoycorev3.DataSource_Filename{
 							Filename: caPath,
 						},
 					},
@@ -102,14 +73,14 @@ func RunEnvoy(envoyExecutable, inputPath, outputPath string) {
 	// 2. Write to a file for debug purposes
 	// since this operation is meant only for debug purposes, we ignore the error
 	// this might fail if root fs is read only
-	_ = os.WriteFile(outputPath, []byte(bootstrapConfig), 0444)
+	_ = os.WriteFile(outputPath, []byte(bootstrapConfig), 0444) //nolint:gosec // G306: Debug file with read-only permissions is intentional
 
 	// 3. Execute Envoy with the provided configuration
 	args := []string{envoyExecutable, "--config-yaml", bootstrapConfig}
 	if len(os.Args) > 1 {
 		args = append(args, os.Args[1:]...)
 	}
-	if err = syscall.Exec(args[0], args, os.Environ()); err != nil {
+	if err = syscall.Exec(args[0], args, os.Environ()); err != nil { //nolint:gosec // G204: Executing Envoy with validated arguments is intentional
 		panic(err)
 	}
 }

@@ -1,8 +1,8 @@
 package backendconfigpolicy
 
 import (
-	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
-	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	envoyclusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+	envoycorev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	preserve_case_v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/http/header_formatters/preserve_case/v3"
 	envoy_upstreams_v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 	"google.golang.org/protobuf/types/known/durationpb"
@@ -14,17 +14,17 @@ import (
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/utils"
 )
 
-func translateCommonHttpProtocolOptions(commonHttpProtocolOptions *v1alpha1.CommonHttpProtocolOptions) *corev3.HttpProtocolOptions {
-	out := &corev3.HttpProtocolOptions{}
+func translateCommonHttpProtocolOptions(commonHttpProtocolOptions *v1alpha1.CommonHttpProtocolOptions) *envoycorev3.HttpProtocolOptions {
+	out := &envoycorev3.HttpProtocolOptions{}
 	if commonHttpProtocolOptions.MaxRequestsPerConnection != nil {
-		out.MaxRequestsPerConnection = &wrapperspb.UInt32Value{Value: uint32(*commonHttpProtocolOptions.MaxRequestsPerConnection)}
+		out.MaxRequestsPerConnection = &wrapperspb.UInt32Value{Value: uint32(*commonHttpProtocolOptions.MaxRequestsPerConnection)} //nolint:gosec // G115: kubebuilder validation ensures 0 <= value <= 4294967295, safe for uint32
 	}
 	if commonHttpProtocolOptions.IdleTimeout != nil {
 		out.IdleTimeout = durationpb.New(commonHttpProtocolOptions.IdleTimeout.Duration)
 	}
 
 	if commonHttpProtocolOptions.MaxHeadersCount != nil {
-		out.MaxHeadersCount = &wrapperspb.UInt32Value{Value: uint32(*commonHttpProtocolOptions.MaxHeadersCount)}
+		out.MaxHeadersCount = &wrapperspb.UInt32Value{Value: uint32(*commonHttpProtocolOptions.MaxHeadersCount)} //nolint:gosec // G115: kubebuilder validation ensures 0 <= value <= 4294967295, safe for uint32
 	}
 
 	if commonHttpProtocolOptions.MaxStreamDuration != nil {
@@ -34,52 +34,44 @@ func translateCommonHttpProtocolOptions(commonHttpProtocolOptions *v1alpha1.Comm
 	return out
 }
 
-func translateHttp1ProtocolOptions(http1ProtocolOptions *v1alpha1.Http1ProtocolOptions) (*corev3.Http1ProtocolOptions, error) {
-	out := &corev3.Http1ProtocolOptions{}
+func translateHttp1ProtocolOptions(http1ProtocolOptions *v1alpha1.Http1ProtocolOptions) (*envoycorev3.Http1ProtocolOptions, error) {
+	out := &envoycorev3.Http1ProtocolOptions{}
 	if http1ProtocolOptions.EnableTrailers != nil {
 		out.EnableTrailers = *http1ProtocolOptions.EnableTrailers
+	}
+
+	if http1ProtocolOptions.PreserveHttp1HeaderCase != nil && *http1ProtocolOptions.PreserveHttp1HeaderCase {
+		typedConfig, err := utils.MessageToAny(&preserve_case_v3.PreserveCaseFormatterConfig{})
+		if err != nil {
+			return nil, err
+		}
+		out.HeaderKeyFormat = &envoycorev3.Http1ProtocolOptions_HeaderKeyFormat{
+			HeaderFormat: &envoycorev3.Http1ProtocolOptions_HeaderKeyFormat_StatefulFormatter{
+				StatefulFormatter: &envoycorev3.TypedExtensionConfig{
+					Name:        PreserveCasePlugin,
+					TypedConfig: typedConfig,
+				},
+			},
+		}
 	}
 
 	if http1ProtocolOptions.OverrideStreamErrorOnInvalidHttpMessage != nil {
 		out.OverrideStreamErrorOnInvalidHttpMessage = &wrapperspb.BoolValue{Value: *http1ProtocolOptions.OverrideStreamErrorOnInvalidHttpMessage}
 	}
 
-	if http1ProtocolOptions.HeaderFormat != nil {
-		switch *http1ProtocolOptions.HeaderFormat {
-		case v1alpha1.ProperCaseHeaderKeyFormat:
-			out.HeaderKeyFormat = &corev3.Http1ProtocolOptions_HeaderKeyFormat{
-				HeaderFormat: &corev3.Http1ProtocolOptions_HeaderKeyFormat_ProperCaseWords_{
-					ProperCaseWords: &corev3.Http1ProtocolOptions_HeaderKeyFormat_ProperCaseWords{},
-				},
-			}
-		case v1alpha1.PreserveCaseHeaderKeyFormat:
-			typedConfig, err := utils.MessageToAny(&preserve_case_v3.PreserveCaseFormatterConfig{})
-			if err != nil {
-				return nil, err
-			}
-			out.HeaderKeyFormat = &corev3.Http1ProtocolOptions_HeaderKeyFormat{
-				HeaderFormat: &corev3.Http1ProtocolOptions_HeaderKeyFormat_StatefulFormatter{
-					StatefulFormatter: &corev3.TypedExtensionConfig{
-						Name:        PreserveCasePlugin,
-						TypedConfig: typedConfig,
-					},
-				},
-			}
-		}
-	}
 	return out, nil
 }
 
-func translateHttp2ProtocolOptions(http2ProtocolOptions *v1alpha1.Http2ProtocolOptions) *corev3.Http2ProtocolOptions {
-	out := &corev3.Http2ProtocolOptions{}
+func translateHttp2ProtocolOptions(http2ProtocolOptions *v1alpha1.Http2ProtocolOptions) *envoycorev3.Http2ProtocolOptions {
+	out := &envoycorev3.Http2ProtocolOptions{}
 	if http2ProtocolOptions.MaxConcurrentStreams != nil {
-		out.MaxConcurrentStreams = &wrapperspb.UInt32Value{Value: uint32(*http2ProtocolOptions.MaxConcurrentStreams)}
+		out.MaxConcurrentStreams = &wrapperspb.UInt32Value{Value: uint32(*http2ProtocolOptions.MaxConcurrentStreams)} //nolint:gosec // G115: kubebuilder validation ensures 0 <= value <= 4294967295, safe for uint32
 	}
 	if http2ProtocolOptions.InitialStreamWindowSize != nil {
-		out.InitialStreamWindowSize = &wrapperspb.UInt32Value{Value: uint32(http2ProtocolOptions.InitialStreamWindowSize.Value())}
+		out.InitialStreamWindowSize = &wrapperspb.UInt32Value{Value: uint32(http2ProtocolOptions.InitialStreamWindowSize.Value())} //nolint:gosec // G115: kubebuilder validation ensures 65535-2147483647 range, safe for uint32
 	}
 	if http2ProtocolOptions.InitialConnectionWindowSize != nil {
-		out.InitialConnectionWindowSize = &wrapperspb.UInt32Value{Value: uint32(http2ProtocolOptions.InitialConnectionWindowSize.Value())}
+		out.InitialConnectionWindowSize = &wrapperspb.UInt32Value{Value: uint32(http2ProtocolOptions.InitialConnectionWindowSize.Value())} //nolint:gosec // G115: kubebuilder validation ensures 65535-2147483647 range, safe for uint32
 	}
 	if http2ProtocolOptions.OverrideStreamErrorOnInvalidHttpMessage != nil {
 		out.OverrideStreamErrorOnInvalidHttpMessage = &wrapperspb.BoolValue{Value: *http2ProtocolOptions.OverrideStreamErrorOnInvalidHttpMessage}
@@ -87,7 +79,7 @@ func translateHttp2ProtocolOptions(http2ProtocolOptions *v1alpha1.Http2ProtocolO
 	return out
 }
 
-func applyCommonHttpProtocolOptions(commonHttpProtocolOptions *corev3.HttpProtocolOptions, backend ir.BackendObjectIR, out *clusterv3.Cluster) {
+func applyCommonHttpProtocolOptions(commonHttpProtocolOptions *envoycorev3.HttpProtocolOptions, _ ir.BackendObjectIR, out *envoyclusterv3.Cluster) {
 	if commonHttpProtocolOptions == nil {
 		return
 	}
@@ -107,7 +99,7 @@ func applyCommonHttpProtocolOptions(commonHttpProtocolOptions *corev3.HttpProtoc
 	}
 }
 
-func applyHttp1ProtocolOptions(http1ProtocolOptions *corev3.Http1ProtocolOptions, backend ir.BackendObjectIR, out *clusterv3.Cluster) {
+func applyHttp1ProtocolOptions(http1ProtocolOptions *envoycorev3.Http1ProtocolOptions, backend ir.BackendObjectIR, out *envoyclusterv3.Cluster) {
 	if http1ProtocolOptions == nil {
 		return
 	}
@@ -130,7 +122,7 @@ func applyHttp1ProtocolOptions(http1ProtocolOptions *corev3.Http1ProtocolOptions
 	}
 }
 
-func applyHttp2ProtocolOptions(http2ProtocolOptions *corev3.Http2ProtocolOptions, backend ir.BackendObjectIR, out *clusterv3.Cluster) {
+func applyHttp2ProtocolOptions(http2ProtocolOptions *envoycorev3.Http2ProtocolOptions, backend ir.BackendObjectIR, out *envoyclusterv3.Cluster) {
 	if http2ProtocolOptions == nil {
 		return
 	}

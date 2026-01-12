@@ -102,10 +102,16 @@ type Service struct {
 	// The actual port numbers are specified in the Gateway resource.
 	//
 	// +optional
-	Ports []*Port `json:"ports"`
+	Ports []Port `json:"ports,omitempty"`
+
+	// ExternalTrafficPolicy defines the external traffic policy for the service.
+	// Valid values are Cluster and Local. Default value is Cluster.
+	//
+	// +optional
+	ExternalTrafficPolicy *string `json:"externalTrafficPolicy,omitempty"`
 }
 
-func (in *Service) GetPorts() []*Port {
+func (in *Service) GetPorts() []Port {
 	if in == nil {
 		return nil
 	}
@@ -116,23 +122,27 @@ type Port struct {
 	// The port number to match on the Gateway
 	//
 	// +required
-	Port uint16 `json:"port"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	Port int32 `json:"port"`
 
 	// The NodePort to be used for the service. If not specified, a random port
 	// will be assigned by the Kubernetes API server.
 	//
 	// +optional
-	NodePort *uint16 `json:"nodePort,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	NodePort *int32 `json:"nodePort,omitempty"`
 }
 
-func (in *Port) GetPort() uint16 {
+func (in *Port) GetPort() int32 {
 	if in == nil {
 		return 0
 	}
 	return in.Port
 }
 
-func (in *Port) GetNodePort() *uint16 {
+func (in *Port) GetNodePort() *int32 {
 	if in == nil {
 		return nil
 	}
@@ -165,6 +175,13 @@ func (in *Service) GetExtraAnnotations() map[string]string {
 		return nil
 	}
 	return in.ExtraAnnotations
+}
+
+func (in *Service) GetExternalTrafficPolicy() *string {
+	if in == nil {
+		return nil
+	}
+	return in.ExternalTrafficPolicy
 }
 
 type ServiceAccount struct {
@@ -252,7 +269,17 @@ type Pod struct {
 	// for details
 	//
 	// +optional
-	TerminationGracePeriodSeconds *int `json:"terminationGracePeriodSeconds,omitempty"`
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=31536000
+	TerminationGracePeriodSeconds *int64 `json:"terminationGracePeriodSeconds,omitempty"`
+
+	// If specified, the pod's startup probe. A probe of container startup readiness.
+	// Container will be only be added to service endpoints if the probe succeeds. See
+	// https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.26/#probe-v1-core
+	// for details.
+	//
+	// +optional
+	StartupProbe *corev1.Probe `json:"startupProbe,omitempty"`
 
 	// If specified, the pod's readiness probe. Periodic probe of container service readiness.
 	// Container will be removed from service endpoints if the probe fails. See
@@ -269,6 +296,20 @@ type Pod struct {
 	//
 	// +optional
 	LivenessProbe *corev1.Probe `json:"livenessProbe,omitempty"`
+
+	// If specified, the pod's topology spread constraints. See
+	// https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.26/#topologyspreadconstraint-v1-core
+	// for details.
+	//
+	// +optional
+	TopologySpreadConstraints []corev1.TopologySpreadConstraint `json:"topologySpreadConstraints,omitempty"`
+
+	// Additional volumes to add to the pod. See
+	// https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.26/#volume-v1-core
+	// for details.
+	//
+	// +optional
+	ExtraVolumes []corev1.Volume `json:"extraVolumes,omitempty"`
 }
 
 func (in *Pod) GetExtraLabels() map[string]string {
@@ -320,6 +361,13 @@ func (in *Pod) GetTolerations() []corev1.Toleration {
 	return in.Tolerations
 }
 
+func (in *Pod) GetStartupProbe() *corev1.Probe {
+	if in == nil {
+		return nil
+	}
+	return in.StartupProbe
+}
+
 func (in *Pod) GetReadinessProbe() *corev1.Probe {
 	if in == nil {
 		return nil
@@ -334,7 +382,7 @@ func (in *Pod) GetGracefulShutdown() *GracefulShutdownSpec {
 	return in.GracefulShutdown
 }
 
-func (in *Pod) GetTerminationGracePeriodSeconds() *int {
+func (in *Pod) GetTerminationGracePeriodSeconds() *int64 {
 	if in == nil {
 		return nil
 	}
@@ -348,6 +396,20 @@ func (in *Pod) GetLivenessProbe() *corev1.Probe {
 	return in.LivenessProbe
 }
 
+func (in *Pod) GetTopologySpreadConstraints() []corev1.TopologySpreadConstraint {
+	if in == nil {
+		return nil
+	}
+	return in.TopologySpreadConstraints
+}
+
+func (in *Pod) GetExtraVolumes() []corev1.Volume {
+	if in == nil {
+		return nil
+	}
+	return in.ExtraVolumes
+}
+
 type GracefulShutdownSpec struct {
 	// Enable grace period before shutdown to finish current requests while Envoy health checks fail to e.g. notify external load balancers. *NOTE:* This will not have any effect if you have not defined health checks via the health check filter
 	//
@@ -357,7 +419,9 @@ type GracefulShutdownSpec struct {
 	// Time (in seconds) for the preStop hook to wait before allowing Envoy to terminate
 	//
 	// +optional
-	SleepTimeSeconds *int `json:"sleepTimeSeconds,omitempty"`
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=31536000
+	SleepTimeSeconds *int64 `json:"sleepTimeSeconds,omitempty"`
 }
 
 func (in *GracefulShutdownSpec) GetEnabled() *bool {
@@ -367,7 +431,7 @@ func (in *GracefulShutdownSpec) GetEnabled() *bool {
 	return in.Enabled
 }
 
-func (in *GracefulShutdownSpec) GetSleepTimeSeconds() *int {
+func (in *GracefulShutdownSpec) GetSleepTimeSeconds() *int64 {
 	if in == nil {
 		return nil
 	}

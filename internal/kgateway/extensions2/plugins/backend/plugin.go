@@ -4,11 +4,11 @@ import (
 	"context"
 	"errors"
 
-	envoy_config_cluster_v3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
-	envoy_config_core_v3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
-	envoy_config_route_v3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	envoyclusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+	envoycorev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	envoyroutev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	envoy_ext_proc_v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_proc/v3"
-	envoyauth "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+	envoytlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	envoywellknown "github.com/envoyproxy/go-control-plane/pkg/wellknown"
 	"istio.io/istio/pkg/config/schema/kubeclient"
 	"istio.io/istio/pkg/kube/kclient"
@@ -21,8 +21,6 @@ import (
 	"k8s.io/utils/ptr"
 
 	"github.com/kgateway-dev/kgateway/v2/api/v1alpha1"
-	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/extensions2/common"
-	extensionsplug "github.com/kgateway-dev/kgateway/v2/internal/kgateway/extensions2/plugin"
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/extensions2/plugins/backend/ai"
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/extensions2/pluginutils"
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/krtcollections"
@@ -31,8 +29,10 @@ import (
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/wellknown"
 	"github.com/kgateway-dev/kgateway/v2/pkg/client/clientset/versioned"
 	"github.com/kgateway-dev/kgateway/v2/pkg/logging"
+	sdk "github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk"
+	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/collections"
 	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/ir"
-	"github.com/kgateway-dev/kgateway/v2/pkg/reports"
+	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/reporter"
 )
 
 var logger = logging.New("plugin/backend")
@@ -78,7 +78,7 @@ func registerTypes(ourCli versioned.Interface) {
 	)
 }
 
-func NewPlugin(ctx context.Context, commoncol *common.CommonCollections) extensionsplug.Plugin {
+func NewPlugin(ctx context.Context, commoncol *collections.CommonCollections) sdk.Plugin {
 	registerTypes(commoncol.OurClient)
 
 	col := krt.WrapClient(kclient.NewFiltered[*v1alpha1.Backend](
@@ -87,7 +87,7 @@ func NewPlugin(ctx context.Context, commoncol *common.CommonCollections) extensi
 	), commoncol.KrtOpts.ToOptions("Backends")...)
 
 	gk := wellknown.BackendGVK.GroupKind()
-	translateFn := buildTranslateFunc(ctx, commoncol.Secrets)
+	translateFn := buildTranslateFunc(ctx, commoncol.Secrets, commoncol.Services, commoncol.Namespaces)
 	bcol := krt.NewCollection(col, func(krtctx krt.HandlerContext, i *v1alpha1.Backend) *ir.BackendObjectIR {
 		backendIR := translateFn(krtctx, i)
 		if len(backendIR.Errors) > 0 {
@@ -106,28 +106,32 @@ func NewPlugin(ctx context.Context, commoncol *common.CommonCollections) extensi
 		backend.Obj = i
 		backend.ObjIr = backendIR
 		backend.Errors = backendIR.Errors
+
+		// Parse common annotations
+		ir.ParseObjectAnnotations(&backend, i)
+
 		return &backend
 	})
 	endpoints := krt.NewCollection(col, func(krtctx krt.HandlerContext, i *v1alpha1.Backend) *ir.EndpointsForBackend {
 		return processEndpoints(i)
 	})
-	return extensionsplug.Plugin{
-		ContributesBackends: map[schema.GroupKind]extensionsplug.BackendPlugin{
+	return sdk.Plugin{
+		ContributesBackends: map[schema.GroupKind]sdk.BackendPlugin{
 			gk: {
 				BackendInit: ir.BackendInit{
-					InitBackend: processBackend,
+					InitEnvoyBackend: processBackendForEnvoy,
 				},
 				Endpoints: endpoints,
 				Backends:  bcol,
 			},
 		},
-		ContributesPolicies: map[schema.GroupKind]extensionsplug.PolicyPlugin{
+		ContributesPolicies: map[schema.GroupKind]sdk.PolicyPlugin{
 			wellknown.BackendGVK.GroupKind(): {
 				Name:                      "backend",
 				NewGatewayTranslationPass: newPlug,
 			},
 		},
-		ContributesRegistration: map[schema.GroupKind]func(){
+		ContributesLeaderAction: map[schema.GroupKind]func(){
 			wellknown.BackendGVK.GroupKind(): buildRegisterCallback(ctx, commoncol.CrudClient, bcol),
 		},
 	}
@@ -138,6 +142,8 @@ func NewPlugin(ctx context.Context, commoncol *common.CommonCollections) extensi
 func buildTranslateFunc(
 	ctx context.Context,
 	secrets *krtcollections.SecretIndex,
+	services krt.Collection[*corev1.Service],
+	namespaces krt.Collection[krtcollections.NamespaceMetadata],
 ) func(krtctx krt.HandlerContext, i *v1alpha1.Backend) *BackendIr {
 	return func(krtctx krt.HandlerContext, i *v1alpha1.Backend) *BackendIr {
 		var backendIr BackendIr
@@ -156,18 +162,18 @@ func buildTranslateFunc(
 				backendIr.Errors = append(backendIr.Errors, err)
 			}
 
-			var lambdaTransportSocket *envoy_config_core_v3.TransportSocket
+			var lambdaTransportSocket *envoycorev3.TransportSocket
 			if endpointConfig.useTLS {
 				// TODO(yuval-k): Add verification context
-				typedConfig, err := utils.MessageToAny(&envoyauth.UpstreamTlsContext{
+				typedConfig, err := utils.MessageToAny(&envoytlsv3.UpstreamTlsContext{
 					Sni: endpointConfig.hostname,
 				})
 				if err != nil {
 					backendIr.Errors = append(backendIr.Errors, err)
 				}
-				lambdaTransportSocket = &envoy_config_core_v3.TransportSocket{
+				lambdaTransportSocket = &envoycorev3.TransportSocket{
 					Name: envoywellknown.TransportSocketTls,
-					ConfigType: &envoy_config_core_v3.TransportSocket_TypedConfig{
+					ConfigType: &envoycorev3.TransportSocket_TypedConfig{
 						TypedConfig: typedConfig,
 					},
 				}
@@ -201,7 +207,7 @@ func buildTranslateFunc(
 			}
 			ns := i.GetNamespace()
 			if i.Spec.AI.LLM != nil {
-				secretRef := getAISecretRef(i.Spec.AI.LLM.Provider)
+				secretRef := getAISecretRef(i.Spec.AI.LLM)
 				// if secretRef is used, set the secret on the backend ir
 				if secretRef != nil {
 					secret, err := pluginutils.GetSecretIr(secrets, krtctx, secretRef.Name, ns)
@@ -212,11 +218,11 @@ func buildTranslateFunc(
 				}
 				return &backendIr
 			}
-			if i.Spec.AI.MultiPool != nil {
+			if len(i.Spec.AI.PriorityGroups) > 0 {
 				backendIr.AIIr.AIMultiSecret = map[string]*ir.Secret{}
-				for idx, priority := range i.Spec.AI.MultiPool.Priorities {
-					for jdx, pool := range priority.Pool {
-						secretRef := getAISecretRef(pool.Provider)
+				for idx, group := range i.Spec.AI.PriorityGroups {
+					for jdx, provider := range group.Providers {
+						secretRef := getAISecretRef(&provider.LLMProvider)
 						if secretRef == nil {
 							continue
 						}
@@ -234,7 +240,11 @@ func buildTranslateFunc(
 	}
 }
 
-func getAISecretRef(llm v1alpha1.SupportedLLMProvider) *corev1.LocalObjectReference {
+func getAISecretRef(llm *v1alpha1.LLMProvider) *corev1.LocalObjectReference {
+	if llm == nil {
+		// should never happen
+		return nil
+	}
 	var secretRef *corev1.LocalObjectReference
 	if llm.OpenAI != nil {
 		secretRef = llm.OpenAI.AuthToken.SecretRef
@@ -251,13 +261,13 @@ func getAISecretRef(llm v1alpha1.SupportedLLMProvider) *corev1.LocalObjectRefere
 	return secretRef
 }
 
-func processBackend(ctx context.Context, in ir.BackendObjectIR, out *envoy_config_cluster_v3.Cluster) *ir.EndpointsForBackend {
+func processBackendForEnvoy(ctx context.Context, in ir.BackendObjectIR, out *envoyclusterv3.Cluster) *ir.EndpointsForBackend {
 	be, ok := in.Obj.(*v1alpha1.Backend)
 	if !ok {
 		logger.Error("failed to cast backend object")
 		return nil
 	}
-	ir, ok := in.ObjIr.(*BackendIr)
+	backendIr, ok := in.ObjIr.(*BackendIr)
 	if !ok {
 		logger.Error("failed to cast backend ir")
 		return nil
@@ -268,25 +278,30 @@ func processBackend(ctx context.Context, in ir.BackendObjectIR, out *envoy_confi
 	spec := be.Spec
 	switch spec.Type {
 	case v1alpha1.BackendTypeStatic:
-		if err := processStatic(spec.Static, out); err != nil {
+		if err := processStaticBackendForEnvoy(spec.Static, out); err != nil {
 			logger.Error("failed to process static backend", "error", err)
+			backendIr.Errors = append(backendIr.Errors, err)
 		}
 	case v1alpha1.BackendTypeAWS:
-		if err := processAws(ir.AwsIr, out); err != nil {
+		if err := processAws(backendIr.AwsIr, out); err != nil {
 			logger.Error("failed to process aws backend", "error", err)
+			backendIr.Errors = append(backendIr.Errors, err)
 		}
 	case v1alpha1.BackendTypeAI:
-		err := ai.ProcessAIBackend(spec.AI, ir.AIIr.AISecret, ir.AIIr.AIMultiSecret, out)
+		err := ai.ProcessAIBackend(spec.AI, backendIr.AIIr.AISecret, backendIr.AIIr.AIMultiSecret, out)
 		if err != nil {
 			logger.Error("failed to process ai backend", "error", err)
+			backendIr.Errors = append(backendIr.Errors, err)
 		}
 		err = ai.AddUpstreamClusterHttpFilters(out)
 		if err != nil {
 			logger.Error("failed to add upstream cluster http filters", "error", err)
+			backendIr.Errors = append(backendIr.Errors, err)
 		}
 	case v1alpha1.BackendTypeDynamicForwardProxy:
 		if err := processDynamicForwardProxy(spec.DynamicForwardProxy, out); err != nil {
 			logger.Error("failed to process dynamic forward proxy backend", "error", err)
+			backendIr.Errors = append(backendIr.Errors, err)
 		}
 	}
 	return nil
@@ -333,7 +348,7 @@ type backendPlugin struct {
 
 var _ ir.ProxyTranslationPass = &backendPlugin{}
 
-func newPlug(ctx context.Context, tctx ir.GwTranslationCtx, reporter reports.Reporter) ir.ProxyTranslationPass {
+func newPlug(tctx ir.GwTranslationCtx, reporter reporter.Reporter) ir.ProxyTranslationPass {
 	return &backendPlugin{}
 }
 
@@ -341,7 +356,7 @@ func (p *backendPlugin) Name() string {
 	return ExtensionName
 }
 
-func (p *backendPlugin) ApplyForBackend(ctx context.Context, pCtx *ir.RouteBackendContext, in ir.HttpBackend, out *envoy_config_route_v3.Route) error {
+func (p *backendPlugin) ApplyForBackend(pCtx *ir.RouteBackendContext, in ir.HttpBackend, out *envoyroutev3.Route) error {
 	backend := pCtx.Backend.Obj.(*v1alpha1.Backend)
 	backendIr := pCtx.Backend.ObjIr.(*BackendIr)
 	switch backend.Spec.Type {
@@ -378,7 +393,7 @@ func (p *backendPlugin) ApplyForBackend(ctx context.Context, pCtx *ir.RouteBacke
 // called 1 time per listener
 // if a plugin emits new filters, they must be with a plugin unique name.
 // any filter returned from route config must be disabled, so it doesnt impact other routes.
-func (p *backendPlugin) HttpFilters(ctx context.Context, fc ir.FilterChainCommon) ([]plugins.StagedHttpFilter, error) {
+func (p *backendPlugin) HttpFilters(fc ir.FilterChainCommon) ([]plugins.StagedHttpFilter, error) {
 	result := []plugins.StagedHttpFilter{}
 
 	var errs []error
@@ -398,10 +413,13 @@ func (p *backendPlugin) HttpFilters(ctx context.Context, fc ir.FilterChainCommon
 }
 
 // called 1 time (per envoy proxy). replaces GeneratedResources
-func (p *backendPlugin) ResourcesToAdd(ctx context.Context) ir.Resources {
-	var additionalClusters []*envoy_config_cluster_v3.Cluster
+func (p *backendPlugin) ResourcesToAdd() ir.Resources {
+	var additionalClusters []*envoyclusterv3.Cluster
 	if len(p.aiGatewayEnabled) > 0 {
-		aiClusters := ai.GetAIAdditionalResources(ctx)
+		aiClusters, err := ai.GetAIAdditionalResources()
+		if err != nil {
+			logger.Error("failed to get ai additional resources", "error", err)
+		}
 		additionalClusters = append(additionalClusters, aiClusters...)
 	}
 	return ir.Resources{

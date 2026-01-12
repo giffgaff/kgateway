@@ -13,7 +13,7 @@ import (
 
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/ir"
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/krtcollections"
-	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/utils/krtutil"
+	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/krtutil"
 )
 
 // buildInlineEndpoints creates a static EndpointsForBackend for non-EDS a ServiceEntry using
@@ -53,6 +53,9 @@ func (s *serviceEntryPlugin) buildInlineEndpoints(ctx context.Context, be ir.Bac
 		s.logger.Error("unresolved endpoints for ServiceEntry", "resource_ref", krt.NewNamed(se).ResourceName())
 		return nil
 	}
+
+	// Set the traffic distribution for the endpoints based on the one specified in the backend
+	endpointsForBackend.TrafficDistribution = be.TrafficDistribution
 
 	return endpointsForBackend
 }
@@ -99,7 +102,7 @@ func endpointsFromWorkloads(
 	// generated from the ServiceEntry iteself
 	var servicePort *networking.ServicePort
 	for _, sp := range se.Spec.GetPorts() {
-		if int32(sp.GetNumber()) == be.Port {
+		if int32(sp.GetNumber()) == be.Port { //nolint:gosec // G115: ServiceEntry port numbers are always valid port range (1-65535)
 			servicePort = sp
 			break
 		}
@@ -107,7 +110,7 @@ func endpointsFromWorkloads(
 
 	seTargetPort := be.Port
 	if sePortTargetPort := servicePort.GetTargetPort(); sePortTargetPort > 0 {
-		seTargetPort = int32(sePortTargetPort)
+		seTargetPort = int32(sePortTargetPort) //nolint:gosec // G115: ServiceEntry target port numbers are always valid port range (1-65535)
 	}
 
 	eps := ir.NewEndpointsForBackend(be)
@@ -133,7 +136,7 @@ func endpointsFromWorkloads(
 		allowAutoMTLS := se.Spec.GetLocation() == networking.ServiceEntry_MESH_INTERNAL
 
 		ep := ir.EndpointWithMd{
-			LbEndpoint: krtcollections.CreateLBEndpoint(address, uint32(epPort), workload.AugmentedLabels, allowAutoMTLS),
+			LbEndpoint: krtcollections.CreateLBEndpoint(address, uint32(epPort), workload.AugmentedLabels, allowAutoMTLS), //nolint:gosec // G115: epPort is derived from valid port numbers
 			EndpointMd: ir.EndpointMetadata{
 				Labels: workload.AugmentedLabels,
 			},

@@ -4,10 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"strconv"
+	"strings"
 
 	"istio.io/istio/pkg/config/labels"
-	"istio.io/istio/pkg/kube/controllers"
 	"istio.io/istio/pkg/kube/krt"
 	"istio.io/istio/pkg/ptr"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -22,15 +21,18 @@ import (
 
 	apiannotations "github.com/kgateway-dev/kgateway/v2/api/annotations"
 	apilabels "github.com/kgateway-dev/kgateway/v2/api/labels"
-	extensionsplug "github.com/kgateway-dev/kgateway/v2/internal/kgateway/extensions2/plugin"
-	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/extensions2/settings"
+	apisettings "github.com/kgateway-dev/kgateway/v2/api/settings"
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/ir"
+	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/krtcollections/metrics"
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/translator/backendref"
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/translator/utils"
-	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/utils/krtutil"
+	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/utils/delegation"
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/wellknown"
-	"github.com/kgateway-dev/kgateway/v2/pkg/metrics"
+	sdk "github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk"
 	pluginsdkir "github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/ir"
+	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/krtutil"
+	pluginsdk "github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/utils"
+	krtpkg "github.com/kgateway-dev/kgateway/v2/pkg/utils/krtutil"
 )
 
 var (
@@ -48,6 +50,14 @@ func (n *NotFoundError) Error() string {
 	return fmt.Sprintf("%s \"%s\" not found", n.NotFoundObj.Kind, n.NotFoundObj.Name)
 }
 
+type BackendPortNotAllowedError struct {
+	BackendName string
+}
+
+func (e *BackendPortNotAllowedError) Error() string {
+	return fmt.Sprintf("BackendRef to \"%s\" includes a port. Do not specify a port when referencing a Backend resource, as it defines its own port configuration", e.BackendName)
+}
+
 // MARK: BackendIndex
 
 type BackendIndex struct {
@@ -60,7 +70,10 @@ type BackendIndex struct {
 
 	// availableBackendsWithPolicy is built from availableBackends, attaching policy to the given backends.
 	// BackendsWithPolicy is the public interface to access this.
-	availableBackendsWithPolicy []krt.Collection[ir.BackendObjectIR]
+	availableBackendsWithPolicy []krt.Collection[*ir.BackendObjectIR]
+	// backendsRequiringPolicyStatus is a collection of backends that have policies that may require status to be written to them.
+	// BackendsWithPolicyRequiringStatus is the public interface to access this.
+	backendsRequiringPolicyStatus []krt.Collection[*ir.BackendObjectIR]
 
 	gkAliases map[schema.GroupKind][]schema.GroupKind
 
@@ -101,11 +114,25 @@ func (i *BackendIndex) HasSynced() bool {
 			return false
 		}
 	}
+	for _, col := range i.availableBackendsWithPolicy {
+		if !col.HasSynced() {
+			return false
+		}
+	}
+	for _, col := range i.backendsRequiringPolicyStatus {
+		if !col.HasSynced() {
+			return false
+		}
+	}
 	return true
 }
 
-func (i *BackendIndex) BackendsWithPolicy() []krt.Collection[ir.BackendObjectIR] {
+func (i *BackendIndex) BackendsWithPolicy() []krt.Collection[*ir.BackendObjectIR] {
 	return i.availableBackendsWithPolicy
+}
+
+func (i *BackendIndex) BackendsWithPolicyRequiringStatus() []krt.Collection[*ir.BackendObjectIR] {
+	return i.backendsRequiringPolicyStatus
 }
 
 // AddBackends builds the backends stored in this BackendIndex by deriving a new BackendObjIR collection
@@ -114,22 +141,43 @@ func (i *BackendIndex) BackendsWithPolicy() []krt.Collection[ir.BackendObjectIR]
 // provied gk. I.e. for the provided gk, it will carry the collection of backends derived from it, with all
 // policies attached.
 func (i *BackendIndex) AddBackends(gk schema.GroupKind, col krt.Collection[ir.BackendObjectIR], aliasKinds ...schema.GroupKind) {
-	backendsWithPoliciesCol := krt.NewCollection(col, func(kctx krt.HandlerContext, backendObj ir.BackendObjectIR) *ir.BackendObjectIR {
-		policies := i.policies.getTargetingPoliciesForBackends(kctx, extensionsplug.BackendAttachmentPoint, backendObj.ObjectSource, "", backendObj.GetObjectLabels(), false)
+	backendsWithPoliciesCol := krt.NewCollection(col, func(kctx krt.HandlerContext, backendObj ir.BackendObjectIR) **ir.BackendObjectIR {
+		policies := i.policies.getTargetingPoliciesForBackends(kctx, backendObj.ObjectSource, "", backendObj.GetObjectLabels(), false)
+		anyHasRef := false
+		for _, p := range policies {
+			if p.PolicyRef != nil {
+				anyHasRef = true
+				break
+			}
+		}
 		for _, aliasObjSrc := range backendObj.Aliases {
 			if aliasObjSrc.Namespace == "" {
 				// targeting policies must be namespace local
 				// some aliases might be "global" but for policy purposes, give them the src namespace
 				aliasObjSrc.Namespace = backendObj.GetNamespace()
 			}
-			aliasPolicies := i.policies.getTargetingPoliciesForBackends(kctx, extensionsplug.BackendAttachmentPoint, aliasObjSrc, "", backendObj.GetObjectLabels(), true)
+			aliasPolicies := i.policies.getTargetingPoliciesForBackends(kctx, aliasObjSrc, "", backendObj.GetObjectLabels(), true)
+			if !anyHasRef {
+				for _, p := range aliasPolicies {
+					if p.PolicyRef != nil {
+						anyHasRef = true
+						break
+					}
+				}
+			}
 			policies = append(policies, aliasPolicies...)
 		}
+		backendObj.RequiresPolicyStatus = anyHasRef
 		backendObj.AttachedPolicies = toAttachedPolicies(policies)
-		return &backendObj
+		return ptr.Of(&backendObj)
 	}, i.krtopts.ToOptions("")...)
-
-	idx := krt.NewIndex(col, func(backendObj ir.BackendObjectIR) (aliasKeys []backendKey) {
+	backendsRequiringPolicyStatus := krt.NewCollection(backendsWithPoliciesCol, func(ctx krt.HandlerContext, i *ir.BackendObjectIR) **ir.BackendObjectIR {
+		if i.RequiresPolicyStatus {
+			return &i
+		}
+		return nil
+	}, i.krtopts.ToOptions("")...)
+	idx := krtpkg.UnnamedIndex(col, func(backendObj ir.BackendObjectIR) (aliasKeys []backendKey) {
 		for _, alias := range backendObj.Aliases {
 			aliasKeys = append(aliasKeys, backendKey{ObjectSource: alias, port: backendObj.Port})
 		}
@@ -138,6 +186,7 @@ func (i *BackendIndex) AddBackends(gk schema.GroupKind, col krt.Collection[ir.Ba
 	i.availableBackends[gk] = col
 	i.aliasIndex[gk] = idx
 	i.availableBackendsWithPolicy = append(i.availableBackendsWithPolicy, backendsWithPoliciesCol)
+	i.backendsRequiringPolicyStatus = append(i.backendsRequiringPolicyStatus, backendsRequiringPolicyStatus)
 
 	// when we query by the alias, also check our "actual" gk
 	for _, aliasGK := range aliasKinds {
@@ -152,6 +201,11 @@ func (i *BackendIndex) getBackend(kctx krt.HandlerContext, gk schema.GroupKind, 
 		Kind:      gk.Kind,
 		Namespace: n.Namespace,
 		Name:      n.Name,
+	}
+
+	// Check if this is a Backend reference and validate that it doesn't specify a port
+	if gk.Group == wellknown.BackendGVK.Group && gk.Kind == wellknown.BackendGVK.Kind && gwport != nil {
+		return nil, &BackendPortNotAllowedError{BackendName: key.Name}
 	}
 
 	var port int32
@@ -277,7 +331,7 @@ func NewGatewayIndex(
 ) *GatewayIndex {
 	h := &GatewayIndex{policies: policies}
 
-	byParentRefIndex := krt.NewIndex(lss, func(in *gwxv1a1.XListenerSet) []targetRefIndexKey {
+	byParentRefIndex := krtpkg.UnnamedIndex(lss, func(in *gwxv1a1.XListenerSet) []targetRefIndexKey {
 		pRef := in.Spec.ParentRef
 		ns := strOr(pRef.Namespace, "")
 		if ns == "" {
@@ -293,52 +347,48 @@ func NewGatewayIndex(
 		}}
 	})
 
-	metricsRecorder := NewCollectionMetricsRecorder("Gateways")
-
-	h.Gateways = krt.NewCollection(gws, func(kctx krt.HandlerContext, i *gwv1.Gateway) *ir.Gateway {
-		defer metricsRecorder.TransformStart()(nil)
-
+	h.Gateways = krt.NewCollection(gws, func(kctx krt.HandlerContext, gw *gwv1.Gateway) *ir.Gateway {
 		// only care about gateways use a class controlled by us
-		gwClass := ptr.Flatten(krt.FetchOne(kctx, gwClasses, krt.FilterKey(string(i.Spec.GatewayClassName))))
+		gwClass := ptr.Flatten(krt.FetchOne(kctx, gwClasses, krt.FilterKey(string(gw.Spec.GatewayClassName))))
 		if gwClass == nil || controllerName != string(gwClass.Spec.ControllerName) {
 			return nil
 		}
 
-		out := ir.Gateway{
+		gwIR := ir.Gateway{
 			ObjectSource: ir.ObjectSource{
 				Group:     gwv1.SchemeGroupVersion.Group,
 				Kind:      wellknown.GatewayKind,
-				Namespace: i.Namespace,
-				Name:      i.Name,
+				Namespace: gw.Namespace,
+				Name:      gw.Name,
 			},
-			Obj:       i,
-			Listeners: make([]ir.Listener, 0, len(i.Spec.Listeners)),
+			Obj:       gw,
+			Listeners: make([]ir.Listener, 0, len(gw.Spec.Listeners)),
 		}
 
-		if i.Annotations[apiannotations.PerConnectionBufferLimit] != "" {
-			limit, err := resource.ParseQuantity(i.Annotations[apiannotations.PerConnectionBufferLimit])
+		if gw.Annotations[apiannotations.PerConnectionBufferLimit] != "" {
+			limit, err := resource.ParseQuantity(gw.Annotations[apiannotations.PerConnectionBufferLimit])
 			if err != nil {
 				logger.Error("failed to parse per connection buffer limit", "error", err)
 			} else {
-				out.PerConnectionBufferLimitBytes = k8sptr.To(uint32(limit.Value()))
+				gwIR.PerConnectionBufferLimitBytes = k8sptr.To(uint32(limit.Value())) //nolint:gosec // G115: Kubernetes resource quantities are always non-negative
 			}
 		}
 
 		// TODO: http polic
 		//		panic("TODO: implement http policies not just listener")
-		out.AttachedListenerPolicies = toAttachedPolicies(
-			h.policies.getTargetingPolicies(kctx, extensionsplug.GatewayAttachmentPoint, out.ObjectSource, "", i.GetLabels()))
-		out.AttachedHttpPolicies = out.AttachedListenerPolicies // see if i can find a better way to segment the listener level and http level policies
-		for _, l := range i.Spec.Listeners {
-			out.Listeners = append(out.Listeners, ir.Listener{
+		gwIR.AttachedListenerPolicies = toAttachedPolicies(
+			h.policies.getTargetingPolicies(kctx, gwIR.ObjectSource, "", gw.GetLabels()))
+		gwIR.AttachedHttpPolicies = gwIR.AttachedListenerPolicies // see if i can find a better way to segment the listener level and http level policies
+		for _, l := range gw.Spec.Listeners {
+			gwIR.Listeners = append(gwIR.Listeners, ir.Listener{
 				Listener:         l,
-				Parent:           i,
-				AttachedPolicies: toAttachedPolicies(h.policies.getTargetingPolicies(kctx, extensionsplug.RouteAttachmentPoint, out.ObjectSource, string(l.Name), i.GetLabels())),
+				Parent:           gw,
+				AttachedPolicies: toAttachedPolicies(h.policies.getTargetingPolicies(kctx, gwIR.ObjectSource, string(l.Name), gw.GetLabels())),
 				PolicyAncestorRef: gwv1.ParentReference{
 					Group:     k8sptr.To(gwv1.Group(wellknown.GatewayGVK.Group)),
 					Kind:      k8sptr.To(gwv1.Kind(wellknown.GatewayGVK.Kind)),
-					Name:      gwv1.ObjectName(i.Name),
-					Namespace: k8sptr.To(gwv1.Namespace(i.Namespace)),
+					Name:      gwv1.ObjectName(gw.Name),
+					Namespace: k8sptr.To(gwv1.Namespace(gw.Namespace)),
 				},
 			})
 		}
@@ -346,13 +396,36 @@ func NewGatewayIndex(
 		listenerSets := krt.Fetch(kctx, lss, krt.FilterIndex(byParentRefIndex, targetRefIndexKey{
 			Group:     wellknown.GatewayGroup,
 			Kind:      wellknown.GatewayKind,
-			Name:      i.GetName(),
-			Namespace: i.GetNamespace(),
+			Name:      gw.GetName(),
+			Namespace: gw.GetNamespace(),
 		}))
 
+		// Sort by listener precedence
+		// Ref: https://gateway-api.sigs.k8s.io/geps/gep-1713/#listener-precedence
+		// - ListenerSet ordered by creation time (oldest first)
+		// - ListenerSet ordered alphabetically by “{namespace}/{name}”
 		slices.SortFunc(listenerSets, func(a, b *gwxv1a1.XListenerSet) int {
-			return a.GetCreationTimestamp().Compare(b.GetCreationTimestamp().Time)
+			// primary sort: creation timestamp (oldest first)
+			if cmp := a.GetCreationTimestamp().Compare(b.GetCreationTimestamp().Time); cmp != 0 {
+				return cmp
+			}
+			// secondary sort: alphabetically by "{namespace}/{name}"
+			nnsString := func(ls *gwxv1a1.XListenerSet) string {
+				return fmt.Sprintf("%s/%s", ls.Namespace, ls.Name)
+			}
+			return strings.Compare(nnsString(a), nnsString(b))
 		})
+
+		// Start the resource sync metrics for all XListenerSets before they are processed,
+		// so they do not have staggered start times.
+		for _, ls := range listenerSets {
+			metrics.StartResourceStatusSync(metrics.ResourceSyncDetails{
+				Namespace:    ls.Namespace,
+				Gateway:      gw.GetName(),
+				ResourceType: wellknown.XListenerSetKind,
+				ResourceName: ls.Name,
+			})
+		}
 
 		for _, ls := range listenerSets {
 			lsIR := ir.ListenerSet{
@@ -365,10 +438,10 @@ func NewGatewayIndex(
 				Obj:       ls,
 				Listeners: make([]ir.Listener, 0),
 			}
-			listenerSetPolicies := h.policies.getTargetingPolicies(kctx, extensionsplug.GatewayAttachmentPoint, lsIR.ObjectSource, "", ls.GetLabels())
+			listenerSetPolicies := h.policies.getTargetingPolicies(kctx, lsIR.ObjectSource, "", ls.GetLabels())
 
 			for _, l := range ls.Spec.Listeners {
-				listenerSpecificPolicies := h.policies.getTargetingPolicies(kctx, extensionsplug.RouteAttachmentPoint, lsIR.ObjectSource, string(l.Name), ls.GetLabels())
+				listenerSpecificPolicies := h.policies.getTargetingPolicies(kctx, lsIR.ObjectSource, string(l.Name), ls.GetLabels())
 				// The Gateway Polices applies to all listeners but we need to apply them to listeners within the LS.
 				// Since there is no LS equivalent in Envoy, apply them on each listener in the LS.
 				// Ensure the sectioned policies are first
@@ -387,52 +460,35 @@ func NewGatewayIndex(
 				})
 			}
 
-			allowedNs, err := allowedListenerSet(i, namespaces)
+			if gw.Spec.AllowedListeners == nil {
+				lsIR.Err = errors.New("Unable to attach to parent, gateway has not enabled allowedListeners")
+				gwIR.DeniedListenerSets = append(gwIR.DeniedListenerSets, lsIR)
+				continue
+			}
+
+			// TODO: this logic should be done once for the Gateway, not per ListenerSet
+			// also means that we should report on the Gateway not any ListenerSet
+			allowedNs, err := allowedListenerSet(gw, namespaces)
 			if err != nil {
-				out.DeniedListenerSets = append(out.DeniedListenerSets, lsIR)
+				lsIR.Err = errors.New("Unable to parse allowedListeners")
+				gwIR.DeniedListenerSets = append(gwIR.DeniedListenerSets, lsIR)
 				continue
 			}
 
 			// Check if the namespace of the listenerSet is allowed by the gateway
 			// We return the denied list of ls to have their status set to rejected during validation
 			if !allowedNs(kctx, ls.GetNamespace()) {
-				out.DeniedListenerSets = append(out.DeniedListenerSets, lsIR)
+				lsIR.Err = errors.New("Attachment not allowed")
+				gwIR.DeniedListenerSets = append(gwIR.DeniedListenerSets, lsIR)
 				continue
 			}
 
-			out.AllowedListenerSets = append(out.AllowedListenerSets, lsIR)
-			out.Listeners = append(out.Listeners, lsIR.Listeners...)
+			gwIR.AllowedListenerSets = append(gwIR.AllowedListenerSets, lsIR)
+			gwIR.Listeners = append(gwIR.Listeners, lsIR.Listeners...)
 		}
 
-		return &out
+		return &gwIR
 	}, krtopts.ToOptions("gateways")...)
-
-	metrics.RegisterEvents(h.Gateways, func(o krt.Event[ir.Gateway]) {
-		switch o.Event {
-		case controllers.EventDelete:
-			metricsRecorder.SetResources(CollectionResourcesMetricLabels{
-				Namespace: o.Latest().Namespace,
-				Name:      o.Latest().Name,
-				Resource:  "Gateway",
-			}, 0)
-			metricsRecorder.SetResources(CollectionResourcesMetricLabels{
-				Namespace: o.Latest().Namespace,
-				Name:      o.Latest().Name,
-				Resource:  "Listeners",
-			}, 0)
-		case controllers.EventAdd, controllers.EventUpdate:
-			metricsRecorder.SetResources(CollectionResourcesMetricLabels{
-				Namespace: o.Latest().Namespace,
-				Name:      o.Latest().Name,
-				Resource:  "Gateway",
-			}, 1)
-			metricsRecorder.SetResources(CollectionResourcesMetricLabels{
-				Namespace: o.Latest().Namespace,
-				Name:      o.Latest().Name,
-				Resource:  "Listeners",
-			}, len(o.Latest().Obj.Spec.Listeners))
-		}
-	})
 
 	return h
 }
@@ -496,8 +552,7 @@ func (k HTTPRouteSelector) String() string {
 
 type globalPolicy struct {
 	schema.GroupKind
-	ir     func(krt.HandlerContext, extensionsplug.AttachmentPoints) ir.PolicyIR
-	points extensionsplug.AttachmentPoints
+	ir func(krt.HandlerContext) ir.PolicyIR
 }
 
 // MARK: PolicyIndex
@@ -537,8 +592,8 @@ func (h *PolicyIndex) HasSynced() bool {
 
 func NewPolicyIndex(
 	krtopts krtutil.KrtOptions,
-	contributesPolicies extensionsplug.ContributesPolicies,
-	globalSettings settings.Settings,
+	contributesPolicies sdk.ContributesPolicies,
+	globalSettings apisettings.Settings,
 ) *PolicyIndex {
 	index := &PolicyIndex{
 		globalPolicyNamespace: globalSettings.GlobalPolicyNamespace,
@@ -557,7 +612,7 @@ func NewPolicyIndex(
 				return &a
 			}, krtopts.ToOptions(fmt.Sprintf("%s-policiesByTargetRef", gk.String()))...)
 
-			targetRefIndex := krt.NewIndex(policiesByTargetRef, func(p ir.PolicyWrapper) []targetRefIndexKey {
+			targetRefIndex := krtpkg.UnnamedIndex(policiesByTargetRef, func(p ir.PolicyWrapper) []targetRefIndexKey {
 				// Every policy is indexed by PolicyRef and PolicyRef without Name (by Group+Kind+Namespace)
 				ret := make([]targetRefIndexKey, len(p.TargetRefs)*2)
 				for i, tr := range p.TargetRefs {
@@ -595,7 +650,6 @@ func NewPolicyIndex(
 			index.globalPolicies = append(index.globalPolicies, globalPolicy{
 				GroupKind: gk,
 				ir:        plugin.GlobalPolicies,
-				points:    plugin.AttachmentPoints(),
 			})
 		}
 	}
@@ -657,28 +711,25 @@ func (p *PolicyIndex) fetchByTargetRefLabels(
 
 func (p *PolicyIndex) getTargetingPoliciesForBackends(
 	kctx krt.HandlerContext,
-	pnt extensionsplug.AttachmentPoints,
 	targetRef ir.ObjectSource,
 	sectionName string,
 	targetLabels map[string]string,
 	excludeGlobal bool,
 ) []ir.PolicyAtt {
-	return p.getTargetingPoliciesMaybeForBackends(kctx, pnt, targetRef, sectionName, true, excludeGlobal, targetLabels)
+	return p.getTargetingPoliciesMaybeForBackends(kctx, targetRef, sectionName, true, excludeGlobal, targetLabels)
 }
 
 func (p *PolicyIndex) getTargetingPolicies(
 	kctx krt.HandlerContext,
-	pnt extensionsplug.AttachmentPoints,
 	targetRef ir.ObjectSource,
 	sectionName string,
 	targetLabels map[string]string,
 ) []ir.PolicyAtt {
-	return p.getTargetingPoliciesMaybeForBackends(kctx, pnt, targetRef, sectionName, false, false, targetLabels)
+	return p.getTargetingPoliciesMaybeForBackends(kctx, targetRef, sectionName, false, false, targetLabels)
 }
 
 func (p *PolicyIndex) getTargetingPoliciesMaybeForBackends(
 	kctx krt.HandlerContext,
-	pnt extensionsplug.AttachmentPoints,
 	targetRef ir.ObjectSource,
 	sectionName string,
 	onlyBackends bool,
@@ -688,14 +739,12 @@ func (p *PolicyIndex) getTargetingPoliciesMaybeForBackends(
 	var ret []ir.PolicyAtt
 	if !excludeGlobal {
 		for _, gp := range p.globalPolicies {
-			if gp.points.Has(pnt) {
-				if p := gp.ir(kctx, pnt); p != nil {
-					gpAtt := ir.PolicyAtt{
-						PolicyIr:  p,
-						GroupKind: gp.GroupKind,
-					}
-					ret = append(ret, gpAtt)
+			if p := gp.ir(kctx); p != nil {
+				gpAtt := ir.PolicyAtt{
+					PolicyIr:  p,
+					GroupKind: gp.GroupKind,
 				}
+				ret = append(ret, gpAtt)
 			}
 		}
 	}
@@ -743,11 +792,21 @@ func (p *PolicyIndex) getTargetingPoliciesMaybeForBackends(
 				Namespace:   p.Namespace,
 				SectionName: sectionName,
 			},
-			Errors: p.Errors,
+			PrecedenceWeight: p.PrecedenceWeight,
+			Errors:           p.Errors,
 		})
 	}
 
 	slices.SortFunc(ret, func(a, b ir.PolicyAtt) int {
+		// Sort policies by their PrecedenceWeight for the same kind if the weights are different,
+		// otherwise sort by creation time
+		if a.GroupKind == b.GroupKind {
+			if a.PrecedenceWeight > b.PrecedenceWeight {
+				return -1
+			} else if a.PrecedenceWeight < b.PrecedenceWeight {
+				return 1
+			}
+		}
 		return a.PolicyIr.CreationTime().Compare(b.PolicyIr.CreationTime())
 	})
 	return ret
@@ -764,6 +823,21 @@ func (p *PolicyIndex) fetchPolicy(kctx krt.HandlerContext, policyRef ir.ObjectSo
 		return krt.FetchOne(kctx, pi.policies, krt.FilterKey(policyRef.ResourceName()))
 	}
 	return nil
+}
+
+// LookupTargetingPolicies returns the policies targeting the given object.
+func (p *PolicyIndex) LookupTargetingPolicies(
+	kctx krt.HandlerContext,
+	targetRef ir.ObjectSource,
+	sectionName string,
+	targetLabels map[string]string,
+) []ir.PolicyAtt {
+	return p.getTargetingPolicies(kctx, targetRef, sectionName, targetLabels)
+}
+
+// PolicyIndex returns the underlying PolicyIndex reference.
+func (i *BackendIndex) PolicyIndex() *PolicyIndex {
+	return i.policies
 }
 
 type refGrantIndexKey struct {
@@ -790,7 +864,7 @@ func (h *RefGrantIndex) HasSynced() bool {
 }
 
 func NewRefGrantIndex(refgrants krt.Collection[*gwv1beta1.ReferenceGrant]) *RefGrantIndex {
-	refGrantIndex := krt.NewIndex(refgrants, func(p *gwv1beta1.ReferenceGrant) []refGrantIndexKey {
+	refGrantIndex := krtpkg.UnnamedIndex(refgrants, func(p *gwv1beta1.ReferenceGrant) []refGrantIndexKey {
 		ret := make([]refGrantIndexKey, 0, len(p.Spec.To)*len(p.Spec.From))
 		for _, from := range p.Spec.From {
 			for _, to := range p.Spec.To {
@@ -898,6 +972,11 @@ func (h *RoutesIndex) HasSynced() bool {
 	return h.httpRoutes.HasSynced() && h.routes.HasSynced() && h.policies.HasSynced() && h.backends.HasSynced() && h.refgrants.HasSynced()
 }
 
+// HTTPRoutes returns the raw krt collection that contains only the HTTPRouteIR.
+func (r *RoutesIndex) HTTPRoutes() krt.Collection[ir.HttpRouteIR] {
+	return r.httpRoutes
+}
+
 func NewRoutesIndex(
 	krtopts krtutil.KrtOptions,
 	httproutes krt.Collection[*gwv1.HTTPRoute],
@@ -907,18 +986,26 @@ func NewRoutesIndex(
 	policies *PolicyIndex,
 	backends *BackendIndex,
 	refgrants *RefGrantIndex,
-	globalSettings settings.Settings,
+	globalSettings apisettings.Settings,
 ) *RoutesIndex {
-	h := &RoutesIndex{policies: policies, refgrants: refgrants, backends: backends, weightedRoutePrecedence: globalSettings.WeightedRoutePrecedence}
+	h := &RoutesIndex{
+		policies:                policies,
+		refgrants:               refgrants,
+		backends:                backends,
+		weightedRoutePrecedence: globalSettings.WeightedRoutePrecedence,
+	}
 	h.hasSyncedFuncs = append(h.hasSyncedFuncs, httproutes.HasSynced, grpcroutes.HasSynced, tcproutes.HasSynced, tlsroutes.HasSynced)
+
 	h.httpRoutes = krt.NewCollection(httproutes, h.transformHttpRoute, krtopts.ToOptions("http-routes-with-policy")...)
 	httpRouteCollection := krt.NewCollection(h.httpRoutes, func(kctx krt.HandlerContext, i ir.HttpRouteIR) *RouteWrapper {
 		return &RouteWrapper{Route: &i}
 	}, krtopts.ToOptions("routes-http-routes-with-policy")...)
+
 	tcpRoutesCollection := krt.NewCollection(tcproutes, func(kctx krt.HandlerContext, i *gwv1a2.TCPRoute) *RouteWrapper {
 		t := h.transformTcpRoute(kctx, i)
 		return &RouteWrapper{Route: t}
 	}, krtopts.ToOptions("routes-tcp-routes-with-policy")...)
+
 	tlsRoutesCollection := krt.NewCollection(tlsroutes, func(kctx krt.HandlerContext, i *gwv1a2.TLSRoute) *RouteWrapper {
 		t := h.transformTlsRoute(kctx, i)
 		return &RouteWrapper{Route: t}
@@ -929,7 +1016,7 @@ func NewRoutesIndex(
 	}, krtopts.ToOptions("routes-grpc-routes-with-policy")...)
 	h.routes = krt.JoinCollection([]krt.Collection[RouteWrapper]{httpRouteCollection, grpcRoutesCollection, tcpRoutesCollection, tlsRoutesCollection}, krtopts.ToOptions("all-routes-with-policy")...)
 
-	httpBySelector := krt.NewIndex(h.httpRoutes, func(i ir.HttpRouteIR) []HTTPRouteSelector {
+	httpBySelector := krtpkg.UnnamedIndex(h.httpRoutes, func(i ir.HttpRouteIR) []HTTPRouteSelector {
 		value, ok := i.SourceObject.GetLabels()[apilabels.DelegationLabelSelector]
 		if !ok {
 			return []HTTPRouteSelector{
@@ -948,7 +1035,7 @@ func NewRoutesIndex(
 	})
 	h.httpBySelector = httpBySelector
 
-	byParentRef := krt.NewIndex(h.routes, func(in RouteWrapper) []targetRefIndexKey {
+	byParentRef := krtpkg.UnnamedIndex(h.routes, func(in RouteWrapper) []targetRefIndexKey {
 		parentRefs := in.Route.GetParentRefs()
 		ret := make([]targetRefIndexKey, len(parentRefs))
 		for i, pRef := range parentRefs {
@@ -1055,7 +1142,7 @@ func (h *RoutesIndex) transformTcpRoute(kctx krt.HandlerContext, i *gwv1a2.TCPRo
 		SourceObject:     i,
 		ParentRefs:       i.Spec.ParentRefs,
 		Backends:         h.getTcpBackends(kctx, src, backends),
-		AttachedPolicies: toAttachedPolicies(h.policies.getTargetingPolicies(kctx, extensionsplug.RouteAttachmentPoint, src, "", i.GetLabels())),
+		AttachedPolicies: toAttachedPolicies(h.policies.getTargetingPolicies(kctx, src, "", i.GetLabels())),
 	}
 }
 
@@ -1076,7 +1163,7 @@ func (h *RoutesIndex) transformTlsRoute(kctx krt.HandlerContext, i *gwv1a2.TLSRo
 		ParentRefs:       i.Spec.ParentRefs,
 		Backends:         h.getTcpBackends(kctx, src, backends),
 		Hostnames:        tostr(i.Spec.Hostnames),
-		AttachedPolicies: toAttachedPolicies(h.policies.getTargetingPolicies(kctx, extensionsplug.RouteAttachmentPoint, src, "", i.GetLabels())),
+		AttachedPolicies: toAttachedPolicies(h.policies.getTargetingPolicies(kctx, src, "", i.GetLabels())),
 	}
 }
 
@@ -1088,12 +1175,12 @@ func (h *RoutesIndex) transformHttpRoute(kctx krt.HandlerContext, i *gwv1.HTTPRo
 		Name:      i.Name,
 	}
 
-	delegationInheritedPolicyPriority := apiannotations.DelegationInheritedPolicyPriorityValue(i.Annotations[apiannotations.DelegationInheritedPolicyPriority])
+	inheritedPolicyPriority := getInheritedPolicyPriority(i.Annotations)
 
 	var precedenceWeight int32
 	var err error
 	if h.weightedRoutePrecedence {
-		precedenceWeight, err = parseRoutePrecedenceWeight(i.Annotations)
+		precedenceWeight, err = pluginsdk.ParsePrecedenceWeightAnnotation(i.Annotations, apiannotations.RoutePrecedenceWeight)
 		if err != nil {
 			logger.Error("error parsing route weight; defaulting to 0", "resource_ref", src, "error", err)
 		}
@@ -1105,12 +1192,13 @@ func (h *RoutesIndex) transformHttpRoute(kctx krt.HandlerContext, i *gwv1.HTTPRo
 		ParentRefs:   i.Spec.ParentRefs,
 		Hostnames:    tostr(i.Spec.Hostnames),
 		Rules: h.transformRules(
-			kctx, src, i.Spec.Rules, i.GetLabels(), ir.WithDelegationInheritedPolicyPriority(delegationInheritedPolicyPriority)),
+			kctx, src, i.Spec.Rules, i.GetLabels(), i.GetAnnotations(), ir.WithInheritedPolicyPriority(inheritedPolicyPriority)),
 		AttachedPolicies: toAttachedPolicies(
-			h.policies.getTargetingPolicies(kctx, extensionsplug.RouteAttachmentPoint, src, "", i.GetLabels()),
-			ir.WithDelegationInheritedPolicyPriority(delegationInheritedPolicyPriority),
+			h.policies.getTargetingPolicies(kctx, src, "", i.GetLabels()),
+			ir.WithInheritedPolicyPriority(inheritedPolicyPriority),
 		),
-		PrecedenceWeight: precedenceWeight,
+		PrecedenceWeight:               precedenceWeight,
+		DelegationInheritParentMatcher: delegation.ShouldInheritParentMatcher(i.GetAnnotations()),
 	}
 }
 
@@ -1119,65 +1207,92 @@ func (h *RoutesIndex) transformRules(
 	src ir.ObjectSource,
 	i []gwv1.HTTPRouteRule,
 	srcLabels map[string]string,
+	srcAnnotations map[string]string,
 	opts ...ir.PolicyAttachmentOpts,
 ) []ir.HttpRouteRuleIR {
 	rules := make([]ir.HttpRouteRuleIR, 0, len(i))
 	for _, r := range i {
-		extensionRefs := h.getExtensionRefs(kctx, src.Namespace, r.Filters)
+		extensionRefs, err := h.getExtensionRefs(kctx, src.Namespace, r.Filters, r.Name, srcAnnotations, opts...)
+
 		var policies ir.AttachedPolicies
 		if r.Name != nil {
-			policies = toAttachedPolicies(h.policies.getTargetingPolicies(kctx, extensionsplug.RouteAttachmentPoint, src, string(*r.Name), srcLabels), opts...)
+			policies = toAttachedPolicies(h.policies.getTargetingPolicies(kctx, src, string(*r.Name), srcLabels), opts...)
 		}
-		rulePolicies := h.getBuiltInRulePolicies(r)
+
+		rulePolicies := h.getBuiltInRulePolicies(r, opts...)
 		policies.Append(rulePolicies)
 
-		rules = append(rules, ir.HttpRouteRuleIR{
+		ruleOut := ir.HttpRouteRuleIR{
 			ExtensionRefs:    extensionRefs,
 			AttachedPolicies: policies,
 			Backends:         h.getBackends(kctx, src, r.BackendRefs),
 			Matches:          r.Matches,
 			Name:             emptyIfNil(r.Name),
-		})
+		}
+		if err != nil {
+			ruleOut.Err = err
+		}
+		rules = append(rules, ruleOut)
 	}
 	return rules
 }
 
-func (h *RoutesIndex) getExtensionRefs(kctx krt.HandlerContext, ns string, r []gwv1.HTTPRouteFilter) ir.AttachedPolicies {
+func (h *RoutesIndex) getExtensionRefs(
+	kctx krt.HandlerContext,
+	ns string,
+	r []gwv1.HTTPRouteFilter,
+	ruleName *gwv1.SectionName,
+	annotations map[string]string,
+	opts ...ir.PolicyAttachmentOpts,
+) (ir.AttachedPolicies, error) {
 	ret := ir.AttachedPolicies{
 		Policies: map[schema.GroupKind][]ir.PolicyAtt{},
 	}
+	var errs []error
 	for _, ext := range r {
-		// TODO: propagate error if we can't find the extension
-		gk, policy, errs := h.resolveExtension(kctx, ns, ext)
-		if policy != nil {
-			ret.Policies[gk] = append(ret.Policies[gk], ir.PolicyAtt{
-				// direct attachment - no target ref
-				PolicyIr: policy,
-				Errors:   errs,
-			})
-		} else if len(errs) > 0 {
-			logger.Error("unresolved HTTPRouteFilter", "error", errors.Join(errs...))
+		policyAtt, err := h.resolveExtension(kctx, ns, ext, ruleName, annotations)
+		if policyAtt != nil {
+			for _, o := range opts {
+				o(policyAtt)
+			}
+			ret.Policies[policyAtt.GroupKind] = append(ret.Policies[policyAtt.GroupKind], *policyAtt)
+		} else if err != nil {
+			errs = append(errs, err)
+			logger.Error("unresolved HTTPRouteFilter", "error", err)
 		}
 	}
-	return ret
+	return ret, errors.Join(errs...)
 }
 
-func (h *RoutesIndex) getBuiltInRulePolicies(rule gwv1.HTTPRouteRule) ir.AttachedPolicies {
+func (h *RoutesIndex) getBuiltInRulePolicies(
+	rule gwv1.HTTPRouteRule,
+	opts ...ir.PolicyAttachmentOpts,
+) ir.AttachedPolicies {
 	ret := ir.AttachedPolicies{
 		Policies: map[schema.GroupKind][]ir.PolicyAtt{},
 	}
 	policy := NewBuiltInRuleIr(rule)
 	if policy != nil {
-		ret.Policies[pluginsdkir.VirtualBuiltInGK] = append(ret.Policies[pluginsdkir.VirtualBuiltInGK], ir.PolicyAtt{PolicyIr: policy /*direct attachment - no target ref*/})
+		policyAtt := ir.PolicyAtt{PolicyIr: policy /*direct attachment - no target ref*/}
+		for _, o := range opts {
+			o(&policyAtt)
+		}
+		ret.Policies[pluginsdkir.VirtualBuiltInGK] = append(ret.Policies[pluginsdkir.VirtualBuiltInGK], policyAtt)
 	}
 	return ret
 }
 
-func (h *RoutesIndex) resolveExtension(kctx krt.HandlerContext, ns string, ext gwv1.HTTPRouteFilter) (schema.GroupKind, ir.PolicyIR, []error) {
+func (h *RoutesIndex) resolveExtension(
+	kctx krt.HandlerContext,
+	ns string,
+	ext gwv1.HTTPRouteFilter,
+	ruleName *gwv1.SectionName,
+	annotations map[string]string,
+) (*ir.PolicyAtt, error) {
 	if ext.Type == gwv1.HTTPRouteFilterExtensionRef {
 		if ext.ExtensionRef == nil {
 			// TODO: report error!!
-			return schema.GroupKind{}, nil, nil
+			return nil, nil
 		}
 		ref := *ext.ExtensionRef
 		key := ir.ObjectSource{
@@ -1188,14 +1303,28 @@ func (h *RoutesIndex) resolveExtension(kctx krt.HandlerContext, ns string, ext g
 		}
 		policy := h.policies.fetchPolicy(kctx, key)
 		if policy == nil {
-			return schema.GroupKind{}, nil, []error{fmt.Errorf("%s: %w", key, ErrPolicyNotFound)}
+			return nil, fmt.Errorf("%s: %w", key, ErrPolicyNotFound)
 		}
 
 		gk := schema.GroupKind{
 			Group: string(ref.Group),
 			Kind:  string(ref.Kind),
 		}
-		return gk, policy.PolicyIR, policy.Errors
+		policyRef := &ir.AttachedPolicyRef{
+			Group:     gk.Group,
+			Kind:      gk.Kind,
+			Name:      string(ref.Name),
+			Namespace: ns,
+		}
+		policyAtt := &ir.PolicyAtt{
+			Generation:       policy.Policy.GetGeneration(),
+			GroupKind:        gk,
+			PolicyIr:         policy.PolicyIR,
+			PolicyRef:        policyRef,
+			Errors:           policy.Errors,
+			PrecedenceWeight: policy.PrecedenceWeight,
+		}
+		return policyAtt, nil
 	}
 
 	fromGK := schema.GroupKind{
@@ -1203,8 +1332,15 @@ func (h *RoutesIndex) resolveExtension(kctx krt.HandlerContext, ns string, ext g
 		Kind:  "HTTPRoute",
 	}
 
-	builtinIR := NewBuiltInIr(kctx, ext, fromGK, ns, h.refgrants, h.backends)
-	return pluginsdkir.VirtualBuiltInGK, builtinIR, nil
+	builtinIR, err := NewBuiltInIr(kctx, ext, fromGK, ns, h.refgrants, h.backends, ruleName, annotations)
+	if err != nil {
+		return nil, err
+	}
+	policyAtt := &ir.PolicyAtt{
+		GroupKind: pluginsdkir.VirtualBuiltInGK,
+		PolicyIr:  builtinIR,
+	}
+	return policyAtt, nil
 }
 
 func toFromBackendRef(fromns string, ref gwv1.BackendObjectReference) ir.ObjectSource {
@@ -1227,7 +1363,9 @@ func toFromBackendRef(fromns string, ref gwv1.BackendObjectReference) ir.ObjectS
 func (h *RoutesIndex) getBackends(kctx krt.HandlerContext, src ir.ObjectSource, backendRefs []gwv1.HTTPBackendRef) []ir.HttpBackendOrDelegate {
 	backends := make([]ir.HttpBackendOrDelegate, 0, len(backendRefs))
 	for _, ref := range backendRefs {
-		extensionRefs := h.getExtensionRefs(kctx, src.Namespace, ref.Filters)
+		// ignore errs as invalid/missing policy for backendRef filters is undefined currently
+		// see: https://github.com/kgateway-dev/kgateway/issues/11897
+		extensionRefs, _ := h.getExtensionRefs(kctx, src.Namespace, ref.Filters, nil, nil)
 		fromns := src.Namespace
 
 		to := toFromBackendRef(fromns, ref.BackendObjectReference)
@@ -1295,7 +1433,7 @@ func weight(w *int32) uint32 {
 	if w == nil {
 		return 1
 	}
-	return uint32(*w)
+	return uint32(*w) //nolint:gosec // G115: weight values are validated to be non-negative in Gateway API
 }
 
 func toAttachedPolicies(policies []ir.PolicyAtt, opts ...ir.PolicyAttachmentOpts) ir.AttachedPolicies {
@@ -1310,11 +1448,12 @@ func toAttachedPolicies(policies []ir.PolicyAtt, opts ...ir.PolicyAttachmentOpts
 		// Create a new PolicyAtt instead of using `p` because the PolicyAttchmentOpts are per-route
 		// and not encoded in `p`
 		polAtt := ir.PolicyAtt{
-			PolicyIr:   p.PolicyIr,
-			PolicyRef:  p.PolicyRef,
-			GroupKind:  gk,
-			Errors:     p.Errors,
-			Generation: p.Generation,
+			PolicyIr:         p.PolicyIr,
+			PolicyRef:        p.PolicyRef,
+			GroupKind:        gk,
+			Errors:           p.Errors,
+			Generation:       p.Generation,
+			PrecedenceWeight: p.PrecedenceWeight,
 		}
 		for _, o := range opts {
 			o(&polAtt)
@@ -1396,14 +1535,17 @@ func (i *BackendIndex) normalizeInfPoolBackendPort(
 	return nil
 }
 
-func parseRoutePrecedenceWeight(annotations map[string]string) (int32, error) {
-	val, ok := annotations[apiannotations.RoutePrecedenceWeight]
+func getInheritedPolicyPriority(annotations map[string]string) apiannotations.InheritedPolicyPriorityValue {
+	def := apiannotations.ShallowMergePreferChild
+	val, ok := annotations[apiannotations.InheritedPolicyPriority]
 	if !ok {
-		return 0, nil
+		return def
 	}
-	weight, err := strconv.ParseInt(val, 10, 32)
-	if err != nil {
-		return 0, fmt.Errorf("invalid value for annotation %s: %s; must be a valid integer", apiannotations.RoutePrecedenceWeight, val)
+	switch v := apiannotations.InheritedPolicyPriorityValue(val); v {
+	case apiannotations.ShallowMergePreferChild, apiannotations.ShallowMergePreferParent, apiannotations.DeepMergePreferChild, apiannotations.DeepMergePreferParent:
+		return v
+	default:
+		logger.Error("invalid value for annotation", "annotation", apiannotations.InheritedPolicyPriority, "value", v)
+		return def
 	}
-	return int32(weight), nil
 }

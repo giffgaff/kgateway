@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	envoy_config_core_v3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
-	envoy_config_route_v3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	envoycorev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	envoyroutev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	envoy_ext_proc_v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_proc/v3"
 	envoytransformation "github.com/solo-io/envoy-gloo/go/config/filter/http/transformation/v2"
 	"google.golang.org/protobuf/proto"
@@ -23,14 +23,14 @@ func TestApplyAIBackend(t *testing.T) {
 	customHeader := "custom-header "
 	customPrefix := "custom-prefix "
 
-	outRoute := &envoy_config_route_v3.Route{}
+	outRoute := &envoyroutev3.Route{}
 
 	tests := []struct {
 		name                string
 		aiBackend           *v1alpha1.AIBackend
 		pCtx                *ir.RouteBackendContext
 		in                  ir.HttpBackend
-		out                 *envoy_config_route_v3.Route
+		out                 *envoyroutev3.Route
 		expectedError       string
 		expectedTypedConfig *map[string]proto.Message
 	}{
@@ -38,13 +38,11 @@ func TestApplyAIBackend(t *testing.T) {
 			name: "Single LLM provider",
 			aiBackend: &v1alpha1.AIBackend{
 				LLM: &v1alpha1.LLMProvider{
-					Provider: v1alpha1.SupportedLLMProvider{
-						OpenAI: &v1alpha1.OpenAIConfig{
-							Model: ptr.To("gpt-3"),
-							AuthToken: v1alpha1.SingleAuthToken{
-								Kind:   v1alpha1.SingleAuthTokenKind("Inline"),
-								Inline: ptr.To("test1"),
-							},
+					OpenAI: &v1alpha1.OpenAIConfig{
+						Model: ptr.To("gpt-3"),
+						AuthToken: v1alpha1.SingleAuthToken{
+							Kind:   v1alpha1.SingleAuthTokenKind("Inline"),
+							Inline: ptr.To("test1"),
 						},
 					},
 				},
@@ -55,7 +53,7 @@ func TestApplyAIBackend(t *testing.T) {
 				wellknown.AIExtProcFilterName: &envoy_ext_proc_v3.ExtProcPerRoute{
 					Override: &envoy_ext_proc_v3.ExtProcPerRoute_Overrides{
 						Overrides: &envoy_ext_proc_v3.ExtProcOverrides{
-							GrpcInitialMetadata: []*envoy_config_core_v3.HeaderValue{
+							GrpcInitialMetadata: []*envoycorev3.HeaderValue{
 								{
 									Key:   "x-llm-provider",
 									Value: "openai",
@@ -114,20 +112,16 @@ func TestApplyAIBackend(t *testing.T) {
 			name: "Single LLM provider with custom path",
 			aiBackend: &v1alpha1.AIBackend{
 				LLM: &v1alpha1.LLMProvider{
-					PathOverride: &v1alpha1.PathOverride{
-						FullPath: &customPath,
-					},
-					AuthHeaderOverride: &v1alpha1.AuthHeaderOverride{
+					Path: &v1alpha1.PathOverride{Full: &customPath},
+					AuthHeader: &v1alpha1.AuthHeader{
 						Prefix:     &customPrefix,
 						HeaderName: &customHeader,
 					},
-					Provider: v1alpha1.SupportedLLMProvider{
-						OpenAI: &v1alpha1.OpenAIConfig{
-							Model: ptr.To("gpt-3"),
-							AuthToken: v1alpha1.SingleAuthToken{
-								Kind:   v1alpha1.SingleAuthTokenKind("Inline"),
-								Inline: ptr.To("test1"),
-							},
+					OpenAI: &v1alpha1.OpenAIConfig{
+						Model: ptr.To("gpt-3"),
+						AuthToken: v1alpha1.SingleAuthToken{
+							Kind:   v1alpha1.SingleAuthTokenKind("Inline"),
+							Inline: ptr.To("test1"),
 						},
 					},
 				},
@@ -138,7 +132,7 @@ func TestApplyAIBackend(t *testing.T) {
 				wellknown.AIExtProcFilterName: &envoy_ext_proc_v3.ExtProcPerRoute{
 					Override: &envoy_ext_proc_v3.ExtProcPerRoute_Overrides{
 						Overrides: &envoy_ext_proc_v3.ExtProcOverrides{
-							GrpcInitialMetadata: []*envoy_config_core_v3.HeaderValue{
+							GrpcInitialMetadata: []*envoycorev3.HeaderValue{
 								{
 									Key:   "x-llm-provider",
 									Value: "openai",
@@ -196,29 +190,29 @@ func TestApplyAIBackend(t *testing.T) {
 		{
 			name: "Multiple LLM providers with different types",
 			aiBackend: &v1alpha1.AIBackend{
-				MultiPool: &v1alpha1.MultiPoolConfig{
-					Priorities: []v1alpha1.Priority{
-						{
-							Pool: []v1alpha1.LLMProvider{
-								{
-									Provider: v1alpha1.SupportedLLMProvider{
-										OpenAI: &v1alpha1.OpenAIConfig{
-											Model: ptr.To("gpt-3"),
-											AuthToken: v1alpha1.SingleAuthToken{
-												Kind:   v1alpha1.SingleAuthTokenKind("Inline"),
-												Inline: ptr.To("test1"),
-											},
+				PriorityGroups: []v1alpha1.PriorityGroup{
+					{
+						Providers: []v1alpha1.NamedLLMProvider{
+							{
+								Name: "openai",
+								LLMProvider: v1alpha1.LLMProvider{
+									OpenAI: &v1alpha1.OpenAIConfig{
+										Model: ptr.To("gpt-3"),
+										AuthToken: v1alpha1.SingleAuthToken{
+											Kind:   v1alpha1.SingleAuthTokenKind("Inline"),
+											Inline: ptr.To("test1"),
 										},
 									},
 								},
-								{
-									Provider: v1alpha1.SupportedLLMProvider{
-										Anthropic: &v1alpha1.AnthropicConfig{
-											Model: ptr.To("claude"),
-											AuthToken: v1alpha1.SingleAuthToken{
-												Kind:   v1alpha1.SingleAuthTokenKind("Inline"),
-												Inline: ptr.To("test2"),
-											},
+							},
+							{
+								Name: "anthropic",
+								LLMProvider: v1alpha1.LLMProvider{
+									Anthropic: &v1alpha1.AnthropicConfig{
+										Model: ptr.To("claude"),
+										AuthToken: v1alpha1.SingleAuthToken{
+											Kind:   v1alpha1.SingleAuthTokenKind("Inline"),
+											Inline: ptr.To("test2"),
 										},
 									},
 								},

@@ -19,6 +19,9 @@ CONFORMANCE="${CONFORMANCE:-false}"
 CONFORMANCE_VERSION="${CONFORMANCE_VERSION:-$(go list -m sigs.k8s.io/gateway-api | awk '{print $2}')}"
 # The channel of the k8s gateway api conformance tests to run. Requires CONFORMANCE=true
 CONFORMANCE_CHANNEL="${CONFORMANCE_CHANNEL:-"experimental"}"
+# The version of the k8s gateway api inference extension CRDs to install. Requires CONFORMANCE=true
+# Managed by `make bump-gie`.
+GIE_CRD_VERSION="v1.1.0"
 # The kind CLI to use. Defaults to the latest version from the kind repo.
 KIND="${KIND:-go tool kind}"
 # The helm CLI to use. Defaults to the latest version from the helm repo.
@@ -72,30 +75,30 @@ else
     VERSION=$VERSION make kind-build-and-load-test-ai-provider
   fi
 
-  if [[ $AGENTGATEWAY == "true" ]]; then
-    VERSION=$VERSION make kind-build-and-load-test-a2a-agent
-  fi
 fi
 
-# 5. Build the gloo command line tool, ensuring we have one in the `_output` folder
-# make -s build-cli-local
-
-# 6. Apply the Kubernetes Gateway API CRDs
+# 5. Apply the Kubernetes Gateway API CRDs
 # Note, we're using kustomize to apply the CRDs from the k8s gateway api repo as
 # kustomize supports remote GH URLs and provides more flexibility compared to
 # alternatives like running a series of `kubectl apply -f <url>` commands. This
 # approach is largely necessary since upstream hasn't adopted a helm chart for
 # the CRDs yet, or won't be for the foreseeable future.
-kubectl apply --kustomize "https://github.com/kubernetes-sigs/gateway-api/config/crd/$CONFORMANCE_CHANNEL?ref=$CONFORMANCE_VERSION"
+if [[ $CONFORMANCE_CHANNEL == "standard" ]]; then
+  kubectl apply --server-side --kustomize "https://github.com/kubernetes-sigs/gateway-api/config/crd?ref=$CONFORMANCE_VERSION"
+else
+  kubectl apply --server-side --kustomize "https://github.com/kubernetes-sigs/gateway-api/config/crd/$CONFORMANCE_CHANNEL?ref=$CONFORMANCE_VERSION"
+fi
+
+# 6. Apply the Kubernetes Gateway API Inference Extension CRDs
+kubectl apply --kustomize "https://github.com/kubernetes-sigs/gateway-api-inference-extension/config/crd?ref=$GIE_CRD_VERSION"
 
 # 7. Conformance test setup
 if [[ $CONFORMANCE == "true" ]]; then
   echo "Running conformance test setup"
-
   . $SCRIPT_DIR/setup-metalllb-on-kind.sh
 fi
 
-# 7. Setup localstack
+# 9. Setup localstack
 if [[ $LOCALSTACK == "true" ]]; then
   echo "Setting up localstack"
   . $SCRIPT_DIR/setup-localstack.sh

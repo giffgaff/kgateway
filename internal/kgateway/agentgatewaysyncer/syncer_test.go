@@ -1,246 +1,537 @@
 package agentgatewaysyncer
 
 import (
-	"context"
 	"testing"
 
-	agentgateway "github.com/agentgateway/agentgateway/go/api"
-	"github.com/agentgateway/agentgateway/go/api/a2a"
-	"github.com/agentgateway/agentgateway/go/api/mcp"
-	envoytypes "github.com/envoyproxy/go-control-plane/pkg/cache/types"
-	envoycache "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
+	"github.com/agentgateway/agentgateway/go/api"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
+	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	agwir "github.com/kgateway-dev/kgateway/v2/pkg/agentgateway/ir"
+	"github.com/kgateway-dev/kgateway/v2/pkg/agentgateway/translator"
 )
 
-// dumpXDSCacheState is a helper function that dump the current state of the XDS cache for the agentgateway cache
-func dumpXDSCacheState(ctx context.Context, cache envoycache.SnapshotCache) {
-	logger.Info("current XDS cache state:")
-
-	// Get all snapshot IDs from cache
-	for _, nodeID := range cache.GetStatusKeys() {
-		logger.Info("snapshot has node", "node_id", nodeID)
-
-		snapshot, err := cache.GetSnapshot(nodeID)
-		if err != nil {
-			logger.Info("error getting snapshot", "error", err.Error())
-			continue
-		}
-
-		// Check for A2A targets
-		logger.Info("A2A targets version", "snapshot", snapshot.GetVersion(TargetTypeA2AUrl)) //nolint:sloglint // ignore msg-type
-		resources := snapshot.GetResources(TargetTypeA2AUrl)
-		for name := range resources {
-			logger.Info("snapshot has resources", "name", name)
-		}
-
-		// Check for MCP targets
-		logger.Info("MCP targets version", "snapshot", snapshot.GetVersion(TargetTypeMcpUrl))
-		resources = snapshot.GetResources(TargetTypeMcpUrl)
-		for name := range resources {
-			logger.Info("snapshot has resources", "name", name)
-		}
-	}
-}
-
-// TestXDSCacheState checks that the xds cache has targets and listeners properly set
-func TestXDSCacheState(t *testing.T) {
-	ctx := context.Background()
-	cache := envoycache.NewSnapshotCache(false, envoycache.IDHash{}, nil)
-
-	a2aTarget := &a2a.Target{
-		Name:      "test-a2a-service",
-		Host:      "10.0.0.1",
-		Port:      8080,
-		Path:      "/api",
-		Listeners: []string{"a2a-listener"},
-	}
-	mcpTarget := &mcp.Target{
-		Name: "test-mcp-service",
-		Target: &mcp.Target_Sse{
-			Sse: &mcp.Target_SseTarget{
-				Host: "10.0.0.2",
-				Port: 8081,
-				Path: "/events",
-			},
-		},
-		Listeners: []string{"mcp-listener"},
-	}
-	listener := &agentgateway.Listener{
-		Name:     "test-listener",
-		Protocol: agentgateway.Listener_A2A,
-		Listener: &agentgateway.Listener_Sse{
-			Sse: &agentgateway.SseListener{
-				Address: "[::]",
-				Port:    8080,
-			},
-		},
-	}
-
-	snapshot := &agentGwSnapshot{
-		AgentGwA2AServices: envoycache.NewResources("v1", []envoytypes.Resource{
-			a2aTarget,
-		}),
-		AgentGwMcpServices: envoycache.NewResources("v1", []envoytypes.Resource{
-			mcpTarget,
-		}),
-		Listeners: envoycache.NewResources("v1", []envoytypes.Resource{
-			listener,
-		}),
-	}
-
-	// Set the snapshot in the cache
-	err := cache.SetSnapshot(ctx, "test-node", snapshot)
-	require.NoError(t, err)
-
-	// Test dumping the cache state
-	dumpXDSCacheState(ctx, cache)
-
-	// Verify the resources were properly set
-	retrievedSnapshot, err := cache.GetSnapshot("test-node")
-	require.NoError(t, err)
-
-	// Verify A2A resources
-	a2aResources := retrievedSnapshot.GetResources(TargetTypeA2AUrl)
-	assert.NotNil(t, a2aResources)
-	assert.Contains(t, a2aResources, "test-a2a-service")
-	retrievedA2A := a2aResources["test-a2a-service"].(*a2a.Target)
-	assert.Equal(t, "10.0.0.1", retrievedA2A.Host)
-	assert.Equal(t, uint32(8080), retrievedA2A.Port)
-	assert.Equal(t, "/api", retrievedA2A.Path)
-
-	// Verify MCP resources
-	mcpResources := retrievedSnapshot.GetResources(TargetTypeMcpUrl)
-	assert.NotNil(t, mcpResources)
-	assert.Contains(t, mcpResources, "test-mcp-service")
-	retrievedMCP := mcpResources["test-mcp-service"].(*mcp.Target)
-	assert.Equal(t, "10.0.0.2", retrievedMCP.GetSse().Host)
-	assert.Equal(t, uint32(8081), retrievedMCP.GetSse().Port)
-	assert.Equal(t, "/events", retrievedMCP.GetSse().Path)
-
-	// Verify Listener resources
-	listenerResources := retrievedSnapshot.GetResources(TargetTypeListenerUrl)
-	assert.NotNil(t, listenerResources)
-	assert.Contains(t, listenerResources, "test-listener")
-	retrievedListener := listenerResources["test-listener"].(*agentgateway.Listener)
-	assert.Equal(t, agentgateway.Listener_A2A, retrievedListener.Protocol)
-	assert.Equal(t, uint32(8080), retrievedListener.GetSse().Port)
-}
-
-// TestGetTargetName checks that the getTargetName function correctly formats target names
-func TestGetTargetName(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		expected string
+func TestBuildAgwFilters(t *testing.T) {
+	testCases := []struct {
+		name            string
+		inputFilters    []gwv1.HTTPRouteFilter
+		expectedFilters []*api.RouteFilter
+		expectedError   bool
 	}{
 		{
-			name:     "simple name",
-			input:    "test-service",
-			expected: "test-service",
+			name: "Request header modifier filter",
+			inputFilters: []gwv1.HTTPRouteFilter{
+				{
+					Type: gwv1.HTTPRouteFilterRequestHeaderModifier,
+					RequestHeaderModifier: &gwv1.HTTPHeaderFilter{
+						Set: []gwv1.HTTPHeader{
+							{Name: "X-Custom-Header", Value: "custom-value"},
+						},
+						Add: []gwv1.HTTPHeader{
+							{Name: "X-Added-Header", Value: "added-value"},
+						},
+						Remove: []string{"X-Remove-Header"},
+					},
+				},
+			},
+			expectedFilters: []*api.RouteFilter{
+				{
+					Kind: &api.RouteFilter_RequestHeaderModifier{
+						RequestHeaderModifier: &api.HeaderModifier{
+							Set: []*api.Header{
+								{Name: "X-Custom-Header", Value: "custom-value"},
+							},
+							Add: []*api.Header{
+								{Name: "X-Added-Header", Value: "added-value"},
+							},
+							Remove: []string{"X-Remove-Header"},
+						},
+					},
+				},
+			},
+			expectedError: false,
 		},
 		{
-			name:     "name with slashes",
-			input:    "namespace/service",
-			expected: "namespace-service",
+			name: "Response header modifier filter",
+			inputFilters: []gwv1.HTTPRouteFilter{
+				{
+					Type: gwv1.HTTPRouteFilterResponseHeaderModifier,
+					ResponseHeaderModifier: &gwv1.HTTPHeaderFilter{
+						Set: []gwv1.HTTPHeader{
+							{Name: "X-Response-Header", Value: "response-value"},
+						},
+					},
+				},
+			},
+			expectedFilters: []*api.RouteFilter{
+				{
+					Kind: &api.RouteFilter_ResponseHeaderModifier{
+						ResponseHeaderModifier: &api.HeaderModifier{
+							Set: []*api.Header{
+								{Name: "X-Response-Header", Value: "response-value"},
+							},
+						},
+					},
+				},
+			},
+			expectedError: false,
 		},
 		{
-			name:     "name with invalid characters",
-			input:    "test@service#123",
-			expected: "test-service-123",
+			name: "Request redirect filter",
+			inputFilters: []gwv1.HTTPRouteFilter{
+				{
+					Type: gwv1.HTTPRouteFilterRequestRedirect,
+					RequestRedirect: &gwv1.HTTPRequestRedirectFilter{
+						Scheme:     ptr.To("https"),
+						Hostname:   ptr.To(gwv1.PreciseHostname("secure.example.com")),
+						StatusCode: ptr.To(301),
+					},
+				},
+			},
+			expectedFilters: []*api.RouteFilter{
+				{
+					Kind: &api.RouteFilter_RequestRedirect{
+						RequestRedirect: &api.RequestRedirect{
+							Scheme: "https",
+							Host:   "secure.example.com",
+							Status: 301,
+						},
+					},
+				},
+			},
+			expectedError: false,
 		},
 		{
-			name:     "name with multiple consecutive dashes",
-			input:    "test--service",
-			expected: "test-service",
-		},
-		{
-			name:     "name with leading/trailing dashes",
-			input:    "-test-service-",
-			expected: "test-service",
+			name: "URL rewrite filter",
+			inputFilters: []gwv1.HTTPRouteFilter{
+				{
+					Type: gwv1.HTTPRouteFilterURLRewrite,
+					URLRewrite: &gwv1.HTTPURLRewriteFilter{
+						Path: &gwv1.HTTPPathModifier{
+							Type:               gwv1.PrefixMatchHTTPPathModifier,
+							ReplacePrefixMatch: ptr.To("/new-prefix"),
+						},
+					},
+				},
+			},
+			expectedFilters: []*api.RouteFilter{
+				{
+					Kind: &api.RouteFilter_UrlRewrite{
+						UrlRewrite: &api.UrlRewrite{
+							Path: &api.UrlRewrite_Prefix{
+								Prefix: "/new-prefix",
+							},
+						},
+					},
+				},
+			},
+			expectedError: false,
 		},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := getTargetName(tt.input)
-			assert.Equal(t, tt.expected, result)
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := translator.RouteContext{
+				RouteContextInputs: translator.RouteContextInputs{
+					Grants:       translator.ReferenceGrants{},
+					RouteParents: translator.RouteParents{},
+				},
+			}
+
+			result, err := translator.BuildAgwFilters(ctx, "default", tc.inputFilters)
+
+			if tc.expectedError {
+				assert.NotNil(t, err)
+				return
+			}
+
+			assert.Nil(t, err)
+			require.Equal(t, len(tc.expectedFilters), len(result))
+
+			for i, expectedFilter := range tc.expectedFilters {
+				actualFilter := result[i]
+
+				// Compare filter types
+				switch expectedFilter.Kind.(type) {
+				case *api.RouteFilter_RequestHeaderModifier:
+					assert.IsType(t, &api.RouteFilter_RequestHeaderModifier{}, actualFilter.Kind)
+				case *api.RouteFilter_ResponseHeaderModifier:
+					assert.IsType(t, &api.RouteFilter_ResponseHeaderModifier{}, actualFilter.Kind)
+				case *api.RouteFilter_RequestRedirect:
+					assert.IsType(t, &api.RouteFilter_RequestRedirect{}, actualFilter.Kind)
+				case *api.RouteFilter_UrlRewrite:
+					assert.IsType(t, &api.RouteFilter_UrlRewrite{}, actualFilter.Kind)
+				}
+			}
 		})
 	}
 }
 
-// TestAgentGwSnapshot checks that the snapshot GetVersion and GetResources methods work as expected
-func TestAgentGwSnapshot(t *testing.T) {
-	a2aTarget := &a2a.Target{
-		Name:      "test-a2a-service",
-		Host:      "10.0.0.1",
-		Port:      8080,
-		Path:      "/api",
-		Listeners: []string{"a2a-listener"},
-	}
-	mcpTarget := &mcp.Target{
-		Name: "test-mcp-service",
-		Target: &mcp.Target_Sse{
-			Sse: &mcp.Target_SseTarget{
-				Host: "10.0.0.2",
-				Port: 8081,
-				Path: "/events",
+func TestGetProtocolAndTLSConfig(t *testing.T) {
+	testCases := []struct {
+		name          string
+		gateway       translator.GatewayListener
+		expectedProto api.Protocol
+		expectedTLS   *api.TLSConfig
+		expectedOk    bool
+	}{
+		{
+			name: "HTTP protocol",
+			gateway: translator.GatewayListener{
+				ParentInfo: translator.ParentInfo{
+					Protocol: gwv1.HTTPProtocolType,
+				},
+				TLSInfo: nil,
 			},
+			expectedProto: api.Protocol_HTTP,
+			expectedTLS:   nil,
+			expectedOk:    true,
 		},
-		Listeners: []string{"mcp-listener"},
-	}
-	listener := &agentgateway.Listener{
-		Name:     "test-listener",
-		Protocol: agentgateway.Listener_A2A,
-		Listener: &agentgateway.Listener_Sse{
-			Sse: &agentgateway.SseListener{
-				Address: "[::]",
-				Port:    8080,
+		{
+			name: "HTTPS protocol with TLS",
+			gateway: translator.GatewayListener{
+				ParentInfo: translator.ParentInfo{
+					Protocol: gwv1.HTTPSProtocolType,
+				},
+				TLSInfo: &translator.TLSInfo{
+					Cert: []byte("cert-data"),
+					Key:  []byte("key-data"),
+				},
 			},
+			expectedProto: api.Protocol_HTTPS,
+			expectedTLS: &api.TLSConfig{
+				Cert:       []byte("cert-data"),
+				PrivateKey: []byte("key-data"),
+			},
+			expectedOk: true,
+		},
+		{
+			name: "HTTPS protocol without TLS (should fail)",
+			gateway: translator.GatewayListener{
+				ParentInfo: translator.ParentInfo{
+					Protocol: gwv1.HTTPSProtocolType,
+				},
+				TLSInfo: nil,
+			},
+			expectedProto: api.Protocol_HTTPS,
+			expectedTLS:   nil,
+			expectedOk:    false,
+		},
+		{
+			name: "TCP protocol",
+			gateway: translator.GatewayListener{
+				ParentInfo: translator.ParentInfo{
+					Protocol: gwv1.TCPProtocolType,
+				},
+				TLSInfo: nil,
+			},
+			expectedProto: api.Protocol_TCP,
+			expectedTLS:   nil,
+			expectedOk:    true,
+		},
+		{
+			name: "TLS protocol with TLS",
+			gateway: translator.GatewayListener{
+				ParentInfo: translator.ParentInfo{
+					Protocol: gwv1.TLSProtocolType,
+				},
+				TLSInfo: &translator.TLSInfo{
+					Cert: []byte("tls-cert"),
+					Key:  []byte("tls-key"),
+				},
+			},
+			expectedProto: api.Protocol_TLS,
+			expectedTLS: &api.TLSConfig{
+				Cert:       []byte("tls-cert"),
+				PrivateKey: []byte("tls-key"),
+			},
+			expectedOk: true,
 		},
 	}
 
-	// manually build the snapshot
-	snapshot := &agentGwSnapshot{
-		AgentGwA2AServices: envoycache.NewResources("v1", []envoytypes.Resource{
-			a2aTarget,
-		}),
-		AgentGwMcpServices: envoycache.NewResources("v1", []envoytypes.Resource{
-			mcpTarget,
-		}),
-		Listeners: envoycache.NewResources("v1", []envoytypes.Resource{
-			listener,
-		}),
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			syncer := &Syncer{}
+
+			proto, tlsConfig, ok := syncer.getProtocolAndTLSConfig(tc.gateway)
+
+			assert.Equal(t, tc.expectedOk, ok)
+			if tc.expectedOk {
+				assert.Equal(t, tc.expectedProto, proto)
+				if tc.expectedTLS != nil {
+					require.NotNil(t, tlsConfig)
+					assert.Equal(t, tc.expectedTLS.Cert, tlsConfig.Cert)
+					assert.Equal(t, tc.expectedTLS.PrivateKey, tlsConfig.PrivateKey)
+				} else {
+					assert.Nil(t, tlsConfig)
+				}
+			}
+		})
+	}
+}
+
+func TestOrphanedBindFiltering(t *testing.T) {
+	testCases := []struct {
+		name             string
+		resourceList     []agwir.AgwResourcesForGateway
+		expectedBindKeys []string
+		description      string
+	}{
+		{
+			name: "orphaned bind filtered out",
+			resourceList: []agwir.AgwResourcesForGateway{
+				{
+					Gateway: types.NamespacedName{Name: "test-gateway", Namespace: "default"},
+					Resources: []*api.Resource{
+						// Orphaned bind - no corresponding listener
+						{
+							Kind: &api.Resource_Bind{
+								Bind: &api.Bind{
+									Key:  "15008/orphan-test-ns/test-example",
+									Port: 15008,
+								},
+							},
+						},
+					},
+				},
+				{
+					Gateway: types.NamespacedName{Name: "test-gateway", Namespace: "default"},
+					Resources: []*api.Resource{
+						// Valid bind with corresponding listener
+						{
+							Kind: &api.Resource_Bind{
+								Bind: &api.Bind{
+									Key:  "80/default/example-gateway",
+									Port: 80,
+								},
+							},
+						},
+						{
+							Kind: &api.Resource_Listener{
+								Listener: &api.Listener{
+									Key:     "default/example-gateway.http",
+									Name:    "http",
+									BindKey: "80/default/example-gateway",
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedBindKeys: []string{"80/default/example-gateway"},
+			description:      "Orphaned bind without listener should be filtered out, valid bind with listener should remain",
+		},
+		{
+			name: "all binds have listeners",
+			resourceList: []agwir.AgwResourcesForGateway{
+				{
+					Gateway: types.NamespacedName{Name: "test-gateway", Namespace: "default"},
+					Resources: []*api.Resource{
+						{
+							Kind: &api.Resource_Bind{
+								Bind: &api.Bind{
+									Key:  "80/default/gateway1",
+									Port: 80,
+								},
+							},
+						},
+						{
+							Kind: &api.Resource_Listener{
+								Listener: &api.Listener{
+									Key:     "default/gateway1.http",
+									BindKey: "80/default/gateway1",
+								},
+							},
+						},
+					},
+				},
+				{
+					Gateway: types.NamespacedName{Name: "test-gateway", Namespace: "default"},
+					Resources: []*api.Resource{
+						{
+							Kind: &api.Resource_Bind{
+								Bind: &api.Bind{
+									Key:  "443/default/gateway1",
+									Port: 443,
+								},
+							},
+						},
+						{
+							Kind: &api.Resource_Listener{
+								Listener: &api.Listener{
+									Key:     "default/gateway1.https",
+									BindKey: "443/default/gateway1",
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedBindKeys: []string{"80/default/gateway1", "443/default/gateway1"},
+			description:      "All binds have corresponding listeners, all should remain",
+		},
+		{
+			name: "multiple listeners one bind",
+			resourceList: []agwir.AgwResourcesForGateway{
+				{
+					Gateway: types.NamespacedName{Name: "test-gateway", Namespace: "default"},
+					Resources: []*api.Resource{
+						{
+							Kind: &api.Resource_Bind{
+								Bind: &api.Bind{
+									Key:  "80/default/multi-listener-gateway",
+									Port: 80,
+								},
+							},
+						},
+						// Multiple listeners referencing the same bind
+						{
+							Kind: &api.Resource_Listener{
+								Listener: &api.Listener{
+									Key:     "default/multi-listener-gateway.http",
+									BindKey: "80/default/multi-listener-gateway",
+								},
+							},
+						},
+						{
+							Kind: &api.Resource_Listener{
+								Listener: &api.Listener{
+									Key:     "default/multi-listener-gateway.http2",
+									BindKey: "80/default/multi-listener-gateway",
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedBindKeys: []string{"80/default/multi-listener-gateway"},
+			description:      "Bind with multiple listeners should remain",
+		},
 	}
 
-	// Construct the version map based on the snapshot
-	err := snapshot.ConstructVersionMap()
-	assert.NoError(t, err)
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Build listener bindKeys map (simulating the optimization in the actual code)
+			listenerBindKeys := make(map[string]bool)
+			for _, resource := range tc.resourceList {
+				for _, res := range resource.Resources {
+					if listenerRes := res.GetListener(); listenerRes != nil {
+						listenerBindKeys[listenerRes.GetBindKey()] = true
+					}
+				}
+			}
 
-	assert.Equal(t, "v1", snapshot.GetVersion(TargetTypeA2AUrl))
-	assert.Equal(t, "v1", snapshot.GetVersion(TargetTypeMcpUrl))
-	assert.Equal(t, "v1", snapshot.GetVersion(TargetTypeListenerUrl))
-	assert.Equal(t, "", snapshot.GetVersion("invalid-type"))
+			// Collect binds that would remain after filtering
+			var actualBindKeys []string
+			for _, resource := range tc.resourceList {
+				for _, res := range resource.Resources {
+					if bindRes := res.GetBind(); bindRes != nil {
+						if listenerBindKeys[bindRes.GetKey()] {
+							actualBindKeys = append(actualBindKeys, bindRes.GetKey())
+						}
+					}
+				}
+			}
+			assert.ElementsMatch(t, tc.expectedBindKeys, actualBindKeys, tc.description)
+		})
+	}
+}
 
-	a2aResources := snapshot.GetResources(TargetTypeA2AUrl)
-	assert.NotNil(t, a2aResources)
-	assert.Len(t, a2aResources, 1)
-	a2aVersionMap := snapshot.GetVersionMap(TargetTypeA2AUrl)
-	assert.NotNil(t, a2aVersionMap)
+func TestAgwResourcesForGatewayEquals(t *testing.T) {
+	testCases := []struct {
+		name      string
+		resource1 agwir.AgwResourcesForGateway
+		resource2 agwir.AgwResourcesForGateway
+		expected  bool
+	}{
+		{
+			name: "Equal bind resources",
+			resource1: agwir.AgwResourcesForGateway{
+				Resources: []*api.Resource{{
+					Kind: &api.Resource_Bind{
+						Bind: &api.Bind{
+							Key:  "test-key",
+							Port: 8080,
+						},
+					},
+				}},
+				Gateway: types.NamespacedName{Name: "test", Namespace: "default"},
+			},
+			resource2: agwir.AgwResourcesForGateway{
+				Resources: []*api.Resource{{
+					Kind: &api.Resource_Bind{
+						Bind: &api.Bind{
+							Key:  "test-key",
+							Port: 8080,
+						},
+					},
+				}},
+				Gateway: types.NamespacedName{Name: "test", Namespace: "default"},
+			},
+			expected: true,
+		},
+		{
+			name: "Different gateway",
+			resource1: agwir.AgwResourcesForGateway{
+				Resources: []*api.Resource{{
+					Kind: &api.Resource_Bind{
+						Bind: &api.Bind{
+							Key:  "test-key",
+							Port: 8080,
+						},
+					},
+				}},
+				Gateway: types.NamespacedName{Name: "test", Namespace: "default"},
+			},
+			resource2: agwir.AgwResourcesForGateway{
+				Resources: []*api.Resource{{
+					Kind: &api.Resource_Bind{
+						Bind: &api.Bind{
+							Key:  "test-key",
+							Port: 8080,
+						},
+					},
+				}},
+				Gateway: types.NamespacedName{Name: "other", Namespace: "default"},
+			},
+			expected: false,
+		},
+		{
+			name: "Different resource port",
+			resource1: agwir.AgwResourcesForGateway{
+				Resources: []*api.Resource{{
+					Kind: &api.Resource_Bind{
+						Bind: &api.Bind{
+							Key:  "test-key",
+							Port: 8080,
+						},
+					},
+				}},
+				Gateway: types.NamespacedName{Name: "test", Namespace: "default"},
+			},
+			resource2: agwir.AgwResourcesForGateway{
+				Resources: []*api.Resource{{
+					Kind: &api.Resource_Bind{
+						Bind: &api.Bind{
+							Key:  "test-key",
+							Port: 9090,
+						},
+					},
+				}},
+				Gateway: types.NamespacedName{Name: "test", Namespace: "default"},
+			},
+			expected: false,
+		},
+	}
 
-	mcpResources := snapshot.GetResources(TargetTypeMcpUrl)
-	assert.NotNil(t, mcpResources)
-	assert.Len(t, mcpResources, 1)
-	mcpVersionMap := snapshot.GetVersionMap(TargetTypeMcpUrl)
-	assert.NotNil(t, mcpVersionMap)
-
-	listenerResources := snapshot.GetResources(TargetTypeListenerUrl)
-	assert.NotNil(t, listenerResources)
-	assert.Len(t, listenerResources, 1)
-	listenerVersionMap := snapshot.GetVersionMap(TargetTypeListenerUrl)
-	assert.NotNil(t, listenerVersionMap)
-
-	err = snapshot.ConstructVersionMap()
-	assert.NoError(t, err)
-	assert.NotNil(t, snapshot.VersionMap)
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := proto.Equal(tc.resource1.Resources[0], tc.resource2.Resources[0]) && tc.resource1.Gateway == tc.resource2.Gateway
+			assert.Equal(t, tc.expected, result)
+		})
+	}
 }

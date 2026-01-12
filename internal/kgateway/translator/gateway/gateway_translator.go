@@ -8,13 +8,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 
-	extensionsplug "github.com/kgateway-dev/kgateway/v2/internal/kgateway/extensions2/plugin"
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/ir"
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/query"
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/translator/listener"
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/translator/metrics"
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/utils"
 	"github.com/kgateway-dev/kgateway/v2/pkg/logging"
+	sdk "github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk"
 	reports "github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/reporter"
 )
 
@@ -24,18 +24,16 @@ type TranslatorConfig struct {
 	ListenerTranslatorConfig listener.ListenerTranslatorConfig
 }
 
-func NewTranslator(queries query.GatewayQueries, settings TranslatorConfig) extensionsplug.KGwTranslator {
+func NewTranslator(queries query.GatewayQueries, settings TranslatorConfig) sdk.KGwTranslator {
 	return &translator{
 		queries:  queries,
 		settings: settings,
-		metrics:  metrics.NewTranslatorMetricsRecorder("TranslateGatewayProxy"),
 	}
 }
 
 type translator struct {
 	queries  query.GatewayQueries
 	settings TranslatorConfig
-	metrics  metrics.TranslatorMetricsRecorder
 }
 
 func (t *translator) Translate(
@@ -48,13 +46,24 @@ func (t *translator) Translate(
 	stopwatch.Start()
 	defer stopwatch.Stop(ctx)
 
-	defer t.metrics.TranslationStart()(nil)
+	var rErr error
+
+	finishMetrics := metrics.CollectTranslationMetrics(metrics.TranslatorMetricLabels{
+		Name:       gateway.Name,
+		Namespace:  gateway.Namespace,
+		Translator: "TranslateGateway",
+	})
+	defer func() {
+		finishMetrics(rErr)
+	}()
 
 	routesForGw, err := t.queries.GetRoutesForGateway(kctx, ctx, gateway)
 	if err != nil {
 		logger.Error("failed to get routes for gateway", "namespace", gateway.Namespace, "name", gateway.Name, "error", err)
 		// TODO: decide how/if to report this error on Gateway
 		// reporter.Gateway(gateway).Err(err.Error())
+		rErr = err
+
 		return nil
 	}
 
@@ -97,6 +106,6 @@ func setAttachedRoutes(gateway *ir.Gateway, routesForGw *query.RoutesForGwResult
 			// TODO we've never checked if the ListenerResult has an error.. is it already on RouteErrors?
 			availRoutes = len(res.Routes)
 		}
-		parentReporter.Listener(&listener.Listener).SetAttachedRoutes(uint(availRoutes))
+		parentReporter.Listener(&listener.Listener).SetAttachedRoutes(uint(availRoutes)) //nolint:gosec // G115: availRoutes is a count of routes, always non-negative
 	}
 }

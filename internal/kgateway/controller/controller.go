@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 
 	"istio.io/istio/pkg/kube/krt"
@@ -12,9 +13,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
+	"sigs.k8s.io/controller-runtime/pkg/certwatcher"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -22,14 +26,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
-	infextv1a2 "sigs.k8s.io/gateway-api-inference-extension/api/v1alpha2"
+	inf "sigs.k8s.io/gateway-api-inference-extension/api/v1"
 	apiv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	internaldeployer "github.com/kgateway-dev/kgateway/v2/internal/kgateway/deployer"
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/ir"
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/wellknown"
 	"github.com/kgateway-dev/kgateway/v2/pkg/deployer"
-	common "github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/collections"
+	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/collections"
 )
 
 const (
@@ -40,18 +44,6 @@ const (
 	InferencePoolField = "inferencepool-index"
 )
 
-// ClassInfo describes the desired configuration for a GatewayClass.
-type ClassInfo struct {
-	// Description is a human-readable description of the GatewayClass.
-	Description string
-	// Labels are the labels to be added to the GatewayClass.
-	Labels map[string]string
-	// Annotations are the annotations to be added to the GatewayClass.
-	Annotations map[string]string
-	// ParametersRef is the reference to the GatewayParameters object.
-	ParametersRef *apiv1.ParametersReference
-}
-
 // TODO [danehans]: Refactor so controller config is organized into shared and Gateway/InferencePool-specific controllers.
 type GatewayConfig struct {
 	Mgr manager.Manager
@@ -60,6 +52,9 @@ type GatewayConfig struct {
 	// ControllerName is the name of the controller. Any GatewayClass objects
 	// managed by this controller must have this name as their ControllerName.
 	ControllerName string
+	// AgwControllerName is the name of the agentgateway controller. Any GatewayClass objects
+	// managed by this controller must have this name as their ControllerName.
+	AgwControllerName string
 	// AutoProvision enables auto-provisioning of GatewayClasses.
 	AutoProvision bool
 	// ControlPlane sets the default control plane information the deployer will use.
@@ -69,23 +64,25 @@ type GatewayConfig struct {
 	IstioAutoMtlsEnabled bool
 	// ImageInfo sets the default image information the deployer will use.
 	ImageInfo *deployer.ImageInfo
-	// ClassInfo sets the default configuration for GatewayClasses managed by this controller.
-	ClassInfo map[string]*ClassInfo
 	// DiscoveryNamespaceFilter filters namespaced objects based on the discovery namespace filter.
 	DiscoveryNamespaceFilter kubetypes.DynamicObjectFilter
 	// CommonCollections used to fetch ir.Gateways for the deployer to generate the ports for the proxy service
-	CommonCollections *common.CommonCollections
+	CommonCollections *collections.CommonCollections
 	// GatewayClassName is the configured gateway class name.
 	GatewayClassName string
 	// WaypointGatewayClassName is the configured waypoint gateway class name.
 	WaypointGatewayClassName string
-	// AgentGatewayClassName is the configured agent gateway class name.
-	AgentGatewayClassName string
+	// AgentgatewayClassName is the configured agent gateway class name.
+	AgentgatewayClassName string
+	// Additional GatewayClass definitions to support extending to other well-known gateway classes
+	AdditionalGatewayClasses map[string]*deployer.GatewayClassInfo
+	// CertWatcher is the shared certificate watcher for xDS TLS
+	CertWatcher *certwatcher.CertWatcher
 }
 
-type ExtraGatewayParametersFunc func(cli client.Client, inputs *deployer.Inputs) []deployer.ExtraGatewayParameters
+type HelmValuesGeneratorOverrideFunc func(cli client.Client, inputs *deployer.Inputs) deployer.HelmValuesGenerator
 
-func NewBaseGatewayController(ctx context.Context, cfg GatewayConfig, extraGatewayParameters ExtraGatewayParametersFunc) error {
+func NewBaseGatewayController(ctx context.Context, cfg GatewayConfig, helmValuesGeneratorOverride HelmValuesGeneratorOverrideFunc, extraGatewayParameters []client.Object) error {
 	log := log.FromContext(ctx)
 	log.V(5).Info("starting gateway controller", "controllerName", cfg.ControllerName)
 
@@ -95,9 +92,10 @@ func NewBaseGatewayController(ctx context.Context, cfg GatewayConfig, extraGatew
 			cli:          cfg.Mgr.GetClient(),
 			scheme:       cfg.Mgr.GetScheme(),
 			customEvents: make(chan event.TypedGenericEvent[ir.Gateway], 1024),
-			metrics:      newControllerMetricsRecorder("gatewayclass"),
+			metricsName:  "gatewayclass",
 		},
-		extraGatewayParameters: extraGatewayParameters,
+		helmValuesGeneratorOverride: helmValuesGeneratorOverride,
+		extraGatewayParameters:      extraGatewayParameters,
 	}
 
 	return run(
@@ -114,10 +112,13 @@ type InferencePoolConfig struct {
 	InferenceExt   *deployer.InferenceExtInfo
 }
 
-func NewBaseInferencePoolController(ctx context.Context,
+func NewBaseInferencePoolController(
+	ctx context.Context,
 	poolCfg *InferencePoolConfig,
 	gwCfg *GatewayConfig,
-	extraGatewayParameters func(cli client.Client, inputs *deployer.Inputs) []deployer.ExtraGatewayParameters) error {
+	helmValuesGeneratorOverride func(cli client.Client, inputs *deployer.Inputs) deployer.HelmValuesGenerator,
+	extraGatewayParameters []client.Object,
+) error {
 	log := log.FromContext(ctx)
 	log.V(5).Info("starting inferencepool controller", "controllerName", poolCfg.ControllerName)
 
@@ -129,9 +130,10 @@ func NewBaseInferencePoolController(ctx context.Context,
 			cli:          poolCfg.Mgr.GetClient(),
 			scheme:       poolCfg.Mgr.GetScheme(),
 			customEvents: make(chan event.TypedGenericEvent[ir.Gateway], 1024),
-			metrics:      newControllerMetricsRecorder("gatewayclass-inferencepool"),
+			metricsName:  "gatewayclass-inferencepool",
 		},
-		extraGatewayParameters: extraGatewayParameters,
+		helmValuesGeneratorOverride: helmValuesGeneratorOverride,
+		extraGatewayParameters:      extraGatewayParameters,
 	}
 
 	return run(ctx, controllerBuilder.watchInferencePool)
@@ -147,10 +149,11 @@ func run(ctx context.Context, funcs ...func(ctx context.Context) error) error {
 }
 
 type controllerBuilder struct {
-	cfg                    GatewayConfig
-	poolCfg                *InferencePoolConfig
-	reconciler             *controllerReconciler
-	extraGatewayParameters func(cli client.Client, inputs *deployer.Inputs) []deployer.ExtraGatewayParameters
+	cfg                         GatewayConfig
+	poolCfg                     *InferencePoolConfig
+	reconciler                  *controllerReconciler
+	helmValuesGeneratorOverride func(cli client.Client, inputs *deployer.Inputs) deployer.HelmValuesGenerator
+	extraGatewayParameters      []client.Object
 }
 
 func (c *controllerBuilder) addIndexes(ctx context.Context) error {
@@ -188,10 +191,13 @@ func gatewayToClass(obj client.Object) []string {
 }
 
 func (c *controllerBuilder) watchGw(ctx context.Context) error {
-	// setup a deployer
 	log := log.FromContext(ctx)
+	log.Info("creating gateway deployer",
+		"ctrlname", c.cfg.ControllerName, "agwctrlname", c.cfg.AgwControllerName,
+		"server", c.cfg.ControlPlane.XdsHost, "port", c.cfg.ControlPlane.XdsPort,
+		"agwport", c.cfg.ControlPlane.AgwXdsPort, "tls", c.cfg.ControlPlane.XdsTLS,
+	)
 
-	log.Info("creating gateway deployer", "ctrlname", c.cfg.ControllerName, "server", c.cfg.ControlPlane.XdsHost, "port", c.cfg.ControlPlane.XdsPort)
 	inputs := &deployer.Inputs{
 		Dev:                      c.cfg.Dev,
 		IstioAutoMtlsEnabled:     c.cfg.IstioAutoMtlsEnabled,
@@ -200,26 +206,21 @@ func (c *controllerBuilder) watchGw(ctx context.Context) error {
 		CommonCollections:        c.cfg.CommonCollections,
 		GatewayClassName:         c.cfg.GatewayClassName,
 		WaypointGatewayClassName: c.cfg.WaypointGatewayClassName,
-		AgentGatewayClassName:    c.cfg.AgentGatewayClassName,
+		AgentgatewayClassName:    c.cfg.AgentgatewayClassName,
 	}
+
 	gwParams := internaldeployer.NewGatewayParameters(c.cfg.Mgr.GetClient(), inputs)
-	if c.extraGatewayParameters != nil {
-		gwParams.WithExtraGatewayParameters(c.extraGatewayParameters(c.cfg.Mgr.GetClient(), inputs)...)
+	if c.helmValuesGeneratorOverride != nil {
+		gwParams.WithHelmValuesGeneratorOverride(c.helmValuesGeneratorOverride(c.cfg.Mgr.GetClient(), inputs))
 	}
-	d, err := internaldeployer.NewGatewayDeployer(c.cfg.ControllerName, c.cfg.Mgr.GetClient(), gwParams)
-	if err != nil {
-		return err
-	}
-	gvks, err := internaldeployer.GatewayGVKsToWatch(ctx, d)
-	if err != nil {
-		return err
+	if len(c.extraGatewayParameters) > 0 {
+		gwParams.WithExtraGatewayParameters(c.extraGatewayParameters...)
 	}
 
 	discoveryNamespaceFilterPredicate := predicate.NewPredicateFuncs(func(o client.Object) bool {
 		filter := c.cfg.DiscoveryNamespaceFilter.Filter(o)
 		return filter
 	})
-
 	buildr := ctrl.NewControllerManagedBy(c.cfg.Mgr).
 		WithEventFilter(discoveryNamespaceFilterPredicate).
 		// Don't use WithEventFilter here as it also filters events for Owned objects.
@@ -230,7 +231,8 @@ func (c *controllerBuilder) watchGw(ctx context.Context) error {
 				predicate.AnnotationChangedPredicate{},
 				predicate.GenerationChangedPredicate{},
 			),
-		))
+		),
+		)
 
 	// watch for changes in GatewayParameters and enqueue Gateways that use them
 	cli := c.cfg.Mgr.GetClient()
@@ -239,20 +241,57 @@ func (c *controllerBuilder) watchGw(ctx context.Context) error {
 			func(ctx context.Context, obj client.Object) []reconcile.Request {
 				gwpName := obj.GetName()
 				gwpNamespace := obj.GetNamespace()
-				// look up the Gateways that are using this GatewayParameters object
+
+				reqs := []reconcile.Request{}
+
+				// 1. Look up Gateways directly using this GatewayParameters object (via spec.infrastructure.parametersRef)
 				var gwList apiv1.GatewayList
 				err := cli.List(ctx, &gwList, client.InNamespace(gwpNamespace), client.MatchingFieldsSelector{Selector: fields.OneTermEqualSelector(GatewayParamsField, gwpName)})
 				if err != nil {
 					log.Error(err, "could not list Gateways using GatewayParameters", "gwpNamespace", gwpNamespace, "gwpName", gwpName)
-					return []reconcile.Request{}
+				} else {
+					for _, gw := range gwList.Items {
+						reqs = append(reqs, reconcile.Request{
+							NamespacedName: client.ObjectKeyFromObject(&gw),
+						})
+					}
 				}
-				// requeue each Gateway that is using this GatewayParameters object
-				reqs := make([]reconcile.Request, 0, len(gwList.Items))
-				for _, gw := range gwList.Items {
-					reqs = append(reqs, reconcile.Request{
-						NamespacedName: client.ObjectKeyFromObject(&gw),
-					})
+
+				// 2. Look up GatewayClasses using this GatewayParameters object (via spec.parametersRef)
+				var gcList apiv1.GatewayClassList
+				err = cli.List(ctx, &gcList)
+				if err != nil {
+					log.Error(err, "could not list GatewayClasses")
+					return reqs
 				}
+
+				// For each GatewayClass that references this parameter, find all Gateways using that class
+				for _, gc := range gcList.Items {
+					// Only process GatewayClasses managed by our controllers
+					if gc.Spec.ControllerName != apiv1.GatewayController(c.cfg.ControllerName) &&
+						gc.Spec.ControllerName != apiv1.GatewayController(c.cfg.AgwControllerName) {
+						continue
+					}
+					if gc.Spec.ParametersRef != nil &&
+						gc.Spec.ParametersRef.Name == gwpName &&
+						gc.Spec.ParametersRef.Namespace != nil && string(*gc.Spec.ParametersRef.Namespace) == gwpNamespace {
+						// This GatewayClass references our GatewayParameters, find all Gateways using this class
+						var classGwList apiv1.GatewayList
+						err := cli.List(ctx, &classGwList, client.MatchingFields{GatewayClassField: gc.Name})
+						if err != nil {
+							log.Error(err, "could not list Gateways for GatewayClass", "gatewayClassName", gc.Name)
+							continue
+						}
+						for _, gw := range classGwList.Items {
+							if c.cfg.DiscoveryNamespaceFilter.Filter(&gw) {
+								reqs = append(reqs, reconcile.Request{
+									NamespacedName: client.ObjectKeyFromObject(&gw),
+								})
+							}
+						}
+					}
+				}
+
 				return reqs
 			}),
 			builder.WithPredicates(discoveryNamespaceFilterPredicate),
@@ -289,7 +328,9 @@ func (c *controllerBuilder) watchGw(ctx context.Context) error {
 		builder.WithPredicates(
 			predicate.NewPredicateFuncs(func(o client.Object) bool {
 				gc, ok := o.(*apiv1.GatewayClass)
-				return ok && gc.Spec.ControllerName == apiv1.GatewayController(c.cfg.ControllerName)
+				// filter for both kgateway and agentgateway controller names
+				return ok && (gc.Spec.ControllerName == apiv1.GatewayController(c.cfg.ControllerName) ||
+					gc.Spec.ControllerName == apiv1.GatewayController(c.cfg.AgwControllerName))
 			}),
 			predicate.GenerationChangedPredicate{},
 		),
@@ -317,6 +358,21 @@ func (c *controllerBuilder) watchGw(ctx context.Context) error {
 		),
 	)
 
+	d, err := internaldeployer.NewGatewayDeployer(
+		c.cfg.ControllerName,
+		c.cfg.AgwControllerName,
+		c.cfg.AgentgatewayClassName,
+		c.cfg.Mgr.GetClient(),
+		gwParams,
+	)
+	if err != nil {
+		return err
+	}
+
+	gvks, err := internaldeployer.GatewayGVKsToWatch(ctx, d)
+	if err != nil {
+		return err
+	}
 	for _, gvk := range gvks {
 		obj, err := c.cfg.Mgr.GetScheme().New(gvk)
 		if err != nil {
@@ -335,14 +391,20 @@ func (c *controllerBuilder) watchGw(ctx context.Context) error {
 		buildr.Owns(clientObj, opts...)
 	}
 
-	return buildr.Complete(&gatewayReconciler{
-		cli:            c.cfg.Mgr.GetClient(),
-		scheme:         c.cfg.Mgr.GetScheme(),
-		controllerName: c.cfg.ControllerName,
-		autoProvision:  c.cfg.AutoProvision,
-		deployer:       d,
-		metrics:        newControllerMetricsRecorder("gateway"),
+	// Watch for xDS TLS certificate changes to update proxy CA certificates. Kick reconciliation for
+	// all Gateways managed by our controllers when the xDS TLS certificate changes.
+	c.setupTLSCertificateWatch(ctx, buildr)
+
+	// The controller should only run on the leader as the gatewayReconciler manages reconciliation.
+	// It deploys and manages the relevant resources (deployment, service, etc.) and should run only on the leader.
+	// This is the default behaviour. Ref: https://github.com/kubernetes-sigs/controller-runtime/blob/682465344b9b74efad4657016668e62438000541/pkg/internal/controller/controller.go#L223
+	// but calling it out explicitly here as the gatewayReconciler is not directly added
+	// as a runnable to the manager and can not be static typed as a manager.LeaderElectionRunnable
+	// Translation is managed by the proxySyncer and runs on all pods (leader and follower)
+	buildr.WithOptions(controller.TypedOptions[reconcile.Request]{
+		NeedLeaderElection: ptr.To(true),
 	})
+	return buildr.Complete(NewGatewayReconciler(ctx, c.cfg, d))
 }
 
 func (c *controllerBuilder) addHTTPRouteIndexes(ctx context.Context) error {
@@ -384,7 +446,7 @@ func (c *controllerBuilder) watchInferencePool(ctx context.Context) error {
 
 	buildr := ctrl.NewControllerManagedBy(c.cfg.Mgr).
 		WithEventFilter(discoveryNamespaceFilterPredicate).
-		For(&infextv1a2.InferencePool{}, builder.WithPredicates(
+		For(&inf.InferencePool{}, builder.WithPredicates(
 			predicate.Or(
 				predicate.AnnotationChangedPredicate{},
 				predicate.GenerationChangedPredicate{},
@@ -433,7 +495,7 @@ func (c *controllerBuilder) watchInferencePool(ctx context.Context) error {
 
 	// If enabled, create a deployer using the controllerBuilder as inputs.
 	if c.poolCfg.InferenceExt != nil {
-		d, err := internaldeployer.NewInferencePoolDeployer(c.cfg.ControllerName, c.cfg.Mgr.GetClient())
+		d, err := internaldeployer.NewInferencePoolDeployer(c.cfg.ControllerName, c.cfg.AgwControllerName, c.cfg.AgentgatewayClassName, c.cfg.Mgr.GetClient())
 		if err != nil {
 			return err
 		}
@@ -462,8 +524,17 @@ func (c *controllerBuilder) watchInferencePool(ctx context.Context) error {
 			cli:      c.cfg.Mgr.GetClient(),
 			scheme:   c.cfg.Mgr.GetScheme(),
 			deployer: d,
-			metrics:  newControllerMetricsRecorder("gateway-inferencepool"),
 		}
+
+		// The controller should only run on the leader as the inferencePoolReconciler manages reconciliation.
+		// It deploys and manages the relevant resources (deployment, service, etc.) and should run only on the leader.
+		// This is the default behaviour. Ref: https://github.com/kubernetes-sigs/controller-runtime/blob/682465344b9b74efad4657016668e62438000541/pkg/internal/controller/controller.go#L223
+		// but calling it out explicitly here as the inferencePoolReconciler is not directly added
+		// as a runnable to the manager and can not be static typed as a manager.LeaderElectionRunnable
+		// Translation is managed by the proxySyncer and runs on all pods (leader and follower)
+		buildr.WithOptions(controller.TypedOptions[reconcile.Request]{
+			NeedLeaderElection: ptr.To(true),
+		})
 		if err := buildr.Complete(r); err != nil {
 			return err
 		}
@@ -489,24 +560,73 @@ func (c *controllerBuilder) watchGwClass(_ context.Context) error {
 		WithEventFilter(predicate.NewPredicateFuncs(func(object client.Object) bool {
 			// we only care about GatewayClasses that use our controller name
 			gwClass, ok := object.(*apiv1.GatewayClass)
-			return ok && gwClass.Spec.ControllerName == apiv1.GatewayController(c.cfg.ControllerName)
+			return ok && (gwClass.Spec.ControllerName == apiv1.GatewayController(c.cfg.ControllerName) ||
+				gwClass.Spec.ControllerName == apiv1.GatewayController(c.cfg.AgwControllerName))
 		})).
 		Complete(c.reconciler)
+}
+
+// setupTLSCertificateWatch configures a watch for xDS TLS certificate changes.
+// When certificates are rotated, all Gateways managed by this controller will be reconciled
+// to update the proxy CA certificates.
+func (c *controllerBuilder) setupTLSCertificateWatch(ctx context.Context, buildr *builder.Builder) {
+	if c.cfg.CertWatcher == nil {
+		return
+	}
+
+	log := log.FromContext(ctx)
+	certChangeCh := make(chan event.GenericEvent, 1)
+	// Register callback to send events when certificate changes
+	c.cfg.CertWatcher.RegisterCallback(func(_ tls.Certificate) {
+		log.Info("xDS TLS certificate changed, triggering Gateway reconciliation")
+		select {
+		case certChangeCh <- event.GenericEvent{}:
+			log.V(1).Info("Sent certificate change event to Gateway controller")
+		default:
+			log.Info("Gateway controller channel full, skipping certificate change notification")
+		}
+	})
+	// Watch the certificate change channel and reconcile affected Gateways
+	buildr.WatchesRawSource(source.Channel(certChangeCh, handler.EnqueueRequestsFromMapFunc(
+		func(ctx context.Context, obj client.Object) []reconcile.Request {
+			var gwList apiv1.GatewayList
+			if err := c.cfg.Mgr.GetClient().List(ctx, &gwList); err != nil {
+				log.Error(err, "failed to list Gateways for certificate change")
+				return nil
+			}
+			reqs := make([]reconcile.Request, 0, len(gwList.Items))
+			for _, gw := range gwList.Items {
+				var gwc apiv1.GatewayClass
+				if err := c.cfg.Mgr.GetClient().Get(ctx, client.ObjectKey{Name: string(gw.Spec.GatewayClassName)}, &gwc); err != nil {
+					log.Error(err, "failed to get GatewayClass for Gateway", "gateway", gw.Name)
+					continue
+				}
+				if gwc.Spec.ControllerName == apiv1.GatewayController(c.cfg.ControllerName) ||
+					gwc.Spec.ControllerName == apiv1.GatewayController(c.cfg.AgwControllerName) {
+					reqs = append(reqs, reconcile.Request{
+						NamespacedName: client.ObjectKeyFromObject(&gw),
+					})
+				}
+			}
+			return reqs
+		}),
+	))
 }
 
 type controllerReconciler struct {
 	cli          client.Client
 	scheme       *runtime.Scheme
 	customEvents chan event.TypedGenericEvent[ir.Gateway]
-	metrics      controllerMetricsRecorder
+	metricsName  string
 }
 
 func (r *controllerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (res ctrl.Result, rErr error) {
 	log := log.FromContext(ctx).WithValues("gwclass", req.NamespacedName)
 
-	if r.metrics != nil {
-		defer r.metrics.reconcileStart()(rErr)
-	}
+	finishMetrics := collectReconciliationMetrics(r.metricsName, req)
+	defer func() {
+		finishMetrics(rErr)
+	}()
 
 	gwclass := &apiv1.GatewayClass{}
 	if err := r.cli.Get(ctx, req.NamespacedName, gwclass); err != nil {
@@ -525,15 +645,6 @@ func (r *controllerReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		Reason:             string(apiv1.GatewayClassReasonAccepted),
 		ObservedGeneration: gwclass.Generation,
 		Message:            "GatewayClass accepted by kgateway controller",
-	})
-
-	// TODO: This should actually check the version of the CRDs in the cluster to be 100% sure
-	meta.SetStatusCondition(&gwclass.Status.Conditions, metav1.Condition{
-		Type:               string(apiv1.GatewayClassConditionStatusSupportedVersion),
-		Status:             metav1.ConditionTrue,
-		ObservedGeneration: gwclass.Generation,
-		Reason:             string(apiv1.GatewayClassReasonSupportedVersion),
-		Message:            "Gateway API version supported by kgateway controller",
 	})
 
 	if err := r.cli.Status().Update(ctx, gwclass); err != nil {

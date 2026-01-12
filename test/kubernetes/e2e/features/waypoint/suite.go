@@ -7,13 +7,12 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/stretchr/testify/suite"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	client "sigs.k8s.io/controller-runtime/pkg/client"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
-
-	"github.com/stretchr/testify/suite"
 
 	"github.com/kgateway-dev/kgateway/v2/pkg/utils/fsutils"
 	"github.com/kgateway-dev/kgateway/v2/test/helpers"
@@ -36,24 +35,24 @@ var (
 
 type testingSuite struct {
 	suite.Suite
-	ctx              context.Context
-	testInstallation *e2e.TestInstallation
-	ingressTesting   bool
+	ctx                context.Context
+	testInstallation   *e2e.TestInstallation
+	ingressUseWaypoint bool
 }
 
 func NewTestingSuite(ctx context.Context, testInst *e2e.TestInstallation) suite.TestingSuite {
 	return &testingSuite{
-		ctx:              ctx,
-		testInstallation: testInst,
-		ingressTesting:   false,
+		ctx:                ctx,
+		testInstallation:   testInst,
+		ingressUseWaypoint: false,
 	}
 }
 
 func NewIngressTestingSuite(ctx context.Context, testInst *e2e.TestInstallation) suite.TestingSuite {
 	return &testingSuite{
-		ctx:              ctx,
-		testInstallation: testInst,
-		ingressTesting:   true,
+		ctx:                ctx,
+		testInstallation:   testInst,
+		ingressUseWaypoint: true,
 	}
 }
 
@@ -115,9 +114,10 @@ func (s *testingSuite) SetupSuite() {
 		}
 	}
 
-	// If it's a suite for ingress testing, we set the KGW_INGRESS_USE_WAYPOINTS env var in the controller deployment
-	if s.ingressTesting {
-		s.setDeploymentEnvVariable()
+	// If it's a suite testing with KGW_INGRESS_USE_WAYPOINTS disabled (enabled by default),
+	// we set the env var in the controller deployment for the tests
+	if !s.ingressUseWaypoint {
+		s.setDeploymentEnvVariable("KGW_INGRESS_USE_WAYPOINTS", "false")
 	}
 }
 
@@ -128,7 +128,7 @@ func (s *testingSuite) TearDownSuite() {
 	}
 }
 
-func (s *testingSuite) setDeploymentEnvVariable() {
+func (s *testingSuite) setDeploymentEnvVariable(name, value string) {
 	controllerNamespace, ok := os.LookupEnv(testutils.InstallNamespace)
 	if !ok {
 		s.FailNow(fmt.Sprintf("%s environment variable not set", testutils.InstallNamespace))
@@ -142,10 +142,10 @@ func (s *testingSuite) setDeploymentEnvVariable() {
 	}, controllerDeploymentOriginal)
 	s.Assert().NoError(err, "has controller deployment")
 
-	// add the environment variable KGW_INGRESS_USE_WAYPOINTS to the modified controller deployment
+	// add the environment variable to the modified controller deployment
 	envVarToAdd := corev1.EnvVar{
-		Name:  "KGW_INGRESS_USE_WAYPOINTS",
-		Value: "true",
+		Name:  name,
+		Value: value,
 	}
 	controllerDeployModified := controllerDeploymentOriginal.DeepCopy()
 	controllerDeployModified.Spec.Template.Spec.Containers[0].Env = append(

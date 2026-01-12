@@ -2,6 +2,9 @@ package krtcollections
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -13,31 +16,45 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
-	"google.golang.org/protobuf/types/known/wrapperspb"
 	"istio.io/istio/pkg/kube/krt"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/utils/ptr"
 
-	envoy_config_core_v3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
-	envoy_config_route_v3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	envoycorev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	envoyroutev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	corsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/cors/v3"
 	envoy_type_matcher_v3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	envoytype "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	envoy_wellknown "github.com/envoyproxy/go-control-plane/pkg/wellknown"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 
-	extensionsplug "github.com/kgateway-dev/kgateway/v2/internal/kgateway/extensions2/plugin"
+	apiannotations "github.com/kgateway-dev/kgateway/v2/api/annotations"
+	v1alpha1 "github.com/kgateway-dev/kgateway/v2/api/v1alpha1"
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/ir"
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/plugins"
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/utils"
+	sdk "github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk"
 	pluginsdkir "github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/ir"
-	"github.com/kgateway-dev/kgateway/v2/pkg/reports"
+	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/policy"
+	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/reporter"
 )
 
-const statefulSessionFilterName = "envoy.filters.http.stateful_session"
+const (
+	statefulSessionFilterName = "envoy.filters.http.stateful_session"
+
+	httpRedirectStatusCodesAllowedMsg = "must be one of 301, 302, 303, 307, 308"
+)
 
 type applyToRoute interface {
-	apply(outputRoute *envoy_config_route_v3.Route)
+	// apply may be invoked multiple times on the route, once for each policy.
+	// For delegated routes, policies attached to the parent route are inherited
+	// and may override the current policy on the output route if MergeOptions allows it,
+	// and hence the apply implementation must use policy.IsSettable(field, mergeOpts)
+	// to check if the field on the output route can be set before being set.
+	// Currently, the apply method is invoked in order of priority from highest(child route policies)
+	// to lowest(parent route policies).
+	apply(outputRoute *envoyroutev3.Route, mergeOpts policy.MergeOptions)
 }
 
 type applyToRouteBackend interface {
@@ -49,28 +66,31 @@ type timeouts struct {
 	backendRequestTimeout *durationpb.Duration
 }
 
-type ruleIr struct {
-	retry              *envoy_config_route_v3.RetryPolicy
-	timeouts           timeouts
-	sessionPersistence *anypb.Any
+type ruleIR struct {
+	timeouts           *timeouts
+	retry              *envoyroutev3.RetryPolicy
+	sessionPersistence *stateful_sessionv3.StatefulSessionPerRoute
 }
 
-type filterIr struct {
+type filterIR struct {
 	filterType gwv1.HTTPRouteFilterType
 
 	policy applyToRoute
 }
 
-func (f *filterIr) apply(outputRoute *envoy_config_route_v3.Route) {
+func (f *filterIR) apply(
+	outputRoute *envoyroutev3.Route,
+	mergeOpts policy.MergeOptions,
+) {
 	if f.policy == nil {
 		return
 	}
-	f.policy.apply(outputRoute)
+	f.policy.apply(outputRoute, mergeOpts)
 }
 
 type builtinPlugin struct {
-	filter  *filterIr
-	rule    ruleIr
+	filter  *filterIR
+	rule    ruleIR
 	hasCors bool
 }
 
@@ -87,31 +107,44 @@ func (d *builtinPlugin) Equals(in any) bool {
 
 type builtinPluginGwPass struct {
 	ir.UnimplementedProxyTranslationPass
-	reporter            reports.Reporter
+	reporter            reporter.Reporter
 	hasCorsPolicy       map[string]bool
 	needStatefulSession map[string]bool
 }
 
-func (p *builtinPluginGwPass) ApplyForBackend(ctx context.Context, pCtx *ir.RouteBackendContext, in ir.HttpBackend, out *envoy_config_route_v3.Route) error {
+func (p *builtinPluginGwPass) ApplyForBackend(pCtx *pluginsdkir.RouteBackendContext, in pluginsdkir.HttpBackend, out *envoyroutev3.Route) error {
 	// no op
 	return nil
 }
 
-func (p *builtinPluginGwPass) ApplyHCM(ctx context.Context, pCtx *ir.HcmContext, out *envoyhttp.HttpConnectionManager) error {
+func (p *builtinPluginGwPass) ApplyHCM(pCtx *pluginsdkir.HcmContext, out *envoyhttp.HttpConnectionManager) error {
 	// no-op
 	return nil
 }
 
-func NewBuiltInIr(kctx krt.HandlerContext, f gwv1.HTTPRouteFilter, fromgk schema.GroupKind, fromns string, refgrants *RefGrantIndex, ups *BackendIndex) ir.PolicyIR {
+func NewBuiltInIr(
+	kctx krt.HandlerContext,
+	f gwv1.HTTPRouteFilter,
+	fromgk schema.GroupKind,
+	fromns string,
+	refgrants *RefGrantIndex,
+	ups *BackendIndex,
+	ruleName *gwv1.SectionName,
+	annotations map[string]string,
+) (ir.PolicyIR, error) {
 	var cors *gwv1.HTTPCORSFilter
 	if f.Type == gwv1.HTTPRouteFilterCORS {
 		cors = f.CORS
 	}
 
+	filterIR, err := convertfilterIR(kctx, f, fromgk, fromns, refgrants, ups, ruleName, annotations)
+	if err != nil {
+		return nil, err
+	}
 	return &builtinPlugin{
 		hasCors: cors != nil,
-		filter:  convertFilterIr(kctx, f, fromgk, fromns, refgrants, ups),
-	}
+		filter:  filterIR,
+	}, nil
 }
 
 func NewBuiltInRuleIr(rule gwv1.HTTPRouteRule) ir.PolicyIR {
@@ -120,49 +153,60 @@ func NewBuiltInRuleIr(rule gwv1.HTTPRouteRule) ir.PolicyIR {
 		return nil
 	}
 	return &builtinPlugin{
-		rule: convertRule(rule),
+		rule: buildHTTPRouteRulePolicy(rule),
 	}
 }
 
-func NewBuiltinPlugin(ctx context.Context) extensionsplug.Plugin {
-	return extensionsplug.Plugin{
-		ContributesPolicies: map[schema.GroupKind]extensionsplug.PolicyPlugin{
+func NewBuiltinPlugin(ctx context.Context) sdk.Plugin {
+	return sdk.Plugin{
+		ContributesPolicies: map[schema.GroupKind]sdk.PolicyPlugin{
 			pluginsdkir.VirtualBuiltInGK: {
-				// AttachmentPoints: []ir.AttachmentPoints{ir.HttpAttachmentPoint},
 				NewGatewayTranslationPass: NewGatewayTranslationPass,
 			},
 		},
 	}
 }
 
-func convertRule(rule gwv1.HTTPRouteRule) ruleIr {
-	return ruleIr{
+func buildHTTPRouteRulePolicy(rule gwv1.HTTPRouteRule) ruleIR {
+	return ruleIR{
 		retry:              convertRetry(rule.Retry, rule.Timeouts),
 		timeouts:           convertTimeouts(rule.Timeouts),
 		sessionPersistence: convertSessionPersistence(rule.SessionPersistence),
 	}
 }
 
-func (r ruleIr) apply(outputRoute *envoy_config_route_v3.Route) error {
+func (p *builtinPluginGwPass) applyRulePolicy(
+	pCtx *ir.RouteContext,
+	r ruleIR,
+	mergeOpts policy.MergeOptions,
+	outputRoute *envoyroutev3.Route,
+) error {
 	// A parent route rule with a delegated backend will not have outputRoute.RouteAction set
 	// but the plugin will be invoked on the rule, so treat this as a no-op call
 	if outputRoute == nil || outputRoute.GetRoute() == nil {
 		return nil
 	}
-	r.applyTimeouts(outputRoute, r.retry != nil)
-	r.applyRetry(outputRoute)
-	if r.sessionPersistence != nil {
+	r.applyTimeouts(outputRoute.GetRoute(), r.retry != nil, mergeOpts)
+	r.applyRetry(outputRoute.GetRoute(), mergeOpts)
+
+	if r.sessionPersistence != nil && policy.IsSettable(outputRoute.GetTypedPerFilterConfig()[statefulSessionFilterName], mergeOpts) {
 		if outputRoute.GetTypedPerFilterConfig() == nil {
 			outputRoute.TypedPerFilterConfig = map[string]*anypb.Any{}
 		}
-		outputRoute.GetTypedPerFilterConfig()[statefulSessionFilterName] = r.sessionPersistence
+		anyMsg, err := utils.MessageToAny(r.sessionPersistence)
+		if err != nil {
+			logger.Error("error marshalling SessionPersistence", "error", err)
+			return err
+		}
+		outputRoute.GetTypedPerFilterConfig()[statefulSessionFilterName] = anyMsg
+		p.needStatefulSession[pCtx.FilterChainName] = true
 	}
 	return nil
 }
 
-func convertTimeouts(timeout *gwv1.HTTPRouteTimeouts) timeouts {
+func convertTimeouts(timeout *gwv1.HTTPRouteTimeouts) *timeouts {
 	if timeout == nil {
-		return timeouts{}
+		return nil
 	}
 	var requestTimeout *durationpb.Duration
 	var backendRequestTimeout *durationpb.Duration
@@ -179,15 +223,20 @@ func convertTimeouts(timeout *gwv1.HTTPRouteTimeouts) timeouts {
 		}
 	}
 
-	return timeouts{
+	return &timeouts{
 		requestTimeout:        requestTimeout,
 		backendRequestTimeout: backendRequestTimeout,
 	}
 }
 
-func (r ruleIr) applyTimeouts(route *envoy_config_route_v3.Route, hasRetry bool) {
+func (r ruleIR) applyTimeouts(
+	action *envoyroutev3.RouteAction,
+	hasRetry bool,
+	mergeOpts policy.MergeOptions,
+) {
 	timeouts := r.timeouts
-	if timeouts.backendRequestTimeout == nil && timeouts.requestTimeout == nil {
+	if timeouts == nil || timeouts.backendRequestTimeout == nil && timeouts.requestTimeout == nil ||
+		!policy.IsSettable(action.GetTimeout(), mergeOpts) {
 		return
 	}
 
@@ -214,39 +263,36 @@ func (r ruleIr) applyTimeouts(route *envoy_config_route_v3.Route, hasRetry bool)
 		return
 	}
 
-	route.GetRoute().Timeout = timeout
+	action.Timeout = timeout
 }
 
-func convertRetry(retry *gwv1.HTTPRouteRetry, timeout *gwv1.HTTPRouteTimeouts) *envoy_config_route_v3.RetryPolicy {
+func convertRetry(
+	retry *gwv1.HTTPRouteRetry,
+	timeout *gwv1.HTTPRouteTimeouts,
+) *envoyroutev3.RetryPolicy {
 	if retry == nil {
 		return nil
 	}
 
-	retryPolicy := &envoy_config_route_v3.RetryPolicy{
-		NumRetries: &wrapperspb.UInt32Value{Value: 1},
-		RetryOn:    "cancelled,connect-failure,refused-stream,retriable-headers,retriable-status-codes,unavailable",
+	in := &v1alpha1.Retry{
+		Attempts: 1,
+		RetryOn: []v1alpha1.RetryOnCondition{
+			"cancelled", "connect-failure", "refused-stream", "retriable-headers", "retriable-status-codes", "unavailable",
+		},
+		StatusCodes: retry.Codes,
 	}
 
 	if retry.Attempts != nil {
-		retryPolicy.NumRetries = &wrapperspb.UInt32Value{Value: uint32(*retry.Attempts)}
-	}
-
-	if len(retry.Codes) > 0 {
-		retryPolicy.RetriableStatusCodes = make([]uint32, len(retry.Codes))
-		for i, c := range retry.Codes {
-			retryPolicy.GetRetriableStatusCodes()[i] = uint32(c)
-		}
+		in.Attempts = int32(*retry.Attempts) //nolint:gosec // G115: retry attempts are small positive integers
 	}
 
 	if retry.Backoff != nil {
-		backoff, err := time.ParseDuration(string(*retry.Backoff))
+		duration, err := time.ParseDuration(string(*retry.Backoff))
 		if err != nil {
 			// duration fields are cel validated, so this should never happen
 			logger.Error("invalid HTTPRoute retry backoff", "backoff", string(*retry.Backoff), "error", err)
 		} else {
-			retryPolicy.RetryBackOff = &envoy_config_route_v3.RetryPolicy_RetryBackOff{
-				BaseInterval: durationpb.New(backoff),
-			}
+			in.BackoffBaseInterval = &metav1.Duration{Duration: duration}
 		}
 	}
 
@@ -254,26 +300,29 @@ func convertRetry(retry *gwv1.HTTPRouteRetry, timeout *gwv1.HTTPRouteTimeouts) *
 	// Otherwise, Envoy will by default use the global route timeout
 	// Refer to https://gateway-api.sigs.k8s.io/geps/gep-1742/
 	if timeout != nil && timeout.BackendRequest != nil {
-		timeoutDuration, err := time.ParseDuration(string(*timeout.BackendRequest))
+		duration, err := time.ParseDuration(string(*timeout.BackendRequest))
 		if err != nil {
 			// duration fields are cel validated, so this should never happen
 			logger.Error("invalid HTTPRoute backend request timeout", "timeout", string(*timeout.BackendRequest), "error", err)
 		} else {
-			retryPolicy.PerTryTimeout = durationpb.New(timeoutDuration)
+			in.PerTryTimeout = &metav1.Duration{Duration: duration}
 		}
 	}
 
-	return retryPolicy
+	return policy.BuildRetryPolicy(in)
 }
 
-func (r ruleIr) applyRetry(route *envoy_config_route_v3.Route) {
-	if r.retry == nil {
+func (r ruleIR) applyRetry(
+	action *envoyroutev3.RouteAction,
+	mergeOpts policy.MergeOptions,
+) {
+	if r.retry == nil || !policy.IsSettable(action.GetRetryPolicy(), mergeOpts) {
 		return
 	}
-	route.GetRoute().RetryPolicy = r.retry
+	action.RetryPolicy = r.retry
 }
 
-func convertSessionPersistence(sessionPersistence *gwv1.SessionPersistence) *anypb.Any {
+func convertSessionPersistence(sessionPersistence *gwv1.SessionPersistence) *stateful_sessionv3.StatefulSessionPerRoute {
 	if sessionPersistence == nil {
 		return nil
 	}
@@ -324,49 +373,43 @@ func convertSessionPersistence(sessionPersistence *gwv1.SessionPersistence) *any
 		return nil
 	}
 	statefulSession := &stateful_sessionv3.StatefulSession{
-		SessionState: &envoy_config_core_v3.TypedExtensionConfig{
+		SessionState: &envoycorev3.TypedExtensionConfig{
 			Name:        "envoy.http.stateful_session." + strings.ToLower(string(spType)),
 			TypedConfig: sessionStateAny,
 		},
 	}
-	perRoute := &stateful_sessionv3.StatefulSessionPerRoute{
+	return &stateful_sessionv3.StatefulSessionPerRoute{
 		Override: &stateful_sessionv3.StatefulSessionPerRoute_StatefulSession{
 			StatefulSession: statefulSession,
 		},
 	}
-	typedConfig, err := utils.MessageToAny(perRoute)
-	if err != nil {
-		logger.Error("failed to create session state: %v", "error", err)
-		return nil
-	}
-	return typedConfig
 }
 
-func translatePathRewrite(outputRoute *envoy_config_route_v3.RedirectAction, pathRewrite *gwv1.HTTPPathModifier) {
+func translatePathRewrite(outputRoute *envoyroutev3.RedirectAction, pathRewrite *gwv1.HTTPPathModifier) {
 	if pathRewrite == nil {
 		return
 	}
 	switch pathRewrite.Type {
 	case gwv1.FullPathHTTPPathModifier:
-		outputRoute.PathRewriteSpecifier = &envoy_config_route_v3.RedirectAction_PathRedirect{
+		outputRoute.PathRewriteSpecifier = &envoyroutev3.RedirectAction_PathRedirect{
 			PathRedirect: ptr.Deref(pathRewrite.ReplaceFullPath, "/"),
 		}
 	case gwv1.PrefixMatchHTTPPathModifier:
-		outputRoute.PathRewriteSpecifier = &envoy_config_route_v3.RedirectAction_PrefixRewrite{
+		outputRoute.PathRewriteSpecifier = &envoyroutev3.RedirectAction_PrefixRewrite{
 			PrefixRewrite: ptr.Deref(pathRewrite.ReplacePrefixMatch, "/"),
 		}
 	}
 }
 
-func translateScheme(out *envoy_config_route_v3.RedirectAction, scheme *string) {
+func translateScheme(out *envoyroutev3.RedirectAction, scheme *string) {
 	if scheme == nil {
 		return
 	}
 
 	if strings.ToLower(*scheme) == "https" {
-		out.SchemeRewriteSpecifier = &envoy_config_route_v3.RedirectAction_HttpsRedirect{HttpsRedirect: true}
+		out.SchemeRewriteSpecifier = &envoyroutev3.RedirectAction_HttpsRedirect{HttpsRedirect: true}
 	} else {
-		out.SchemeRewriteSpecifier = &envoy_config_route_v3.RedirectAction_SchemeRedirect{SchemeRedirect: *scheme}
+		out.SchemeRewriteSpecifier = &envoyroutev3.RedirectAction_SchemeRedirect{SchemeRedirect: *scheme}
 	}
 }
 
@@ -374,7 +417,7 @@ func translatePort(port *gwv1.PortNumber) uint32 {
 	if port == nil {
 		return 0
 	}
-	return uint32(*port)
+	return uint32(*port) //nolint:gosec // G115: Gateway API PortNumber is int32, always valid port range
 }
 
 func translateHostname(hostname *gwv1.PreciseHostname) string {
@@ -384,39 +427,105 @@ func translateHostname(hostname *gwv1.PreciseHostname) string {
 	return string(*hostname)
 }
 
-func translateStatusCode(i *int) envoy_config_route_v3.RedirectAction_RedirectResponseCode {
-	if i == nil {
-		return envoy_config_route_v3.RedirectAction_FOUND
+func translateStatusCode(
+	statusCode *int,
+	ruleName *gwv1.SectionName,
+	annotations map[string]string,
+) (envoyroutev3.RedirectAction_RedirectResponseCode, error) {
+	var overrideStatusCode *int
+	var err error
+	if value, ok := annotations[apiannotations.HTTPRedirectStatusCode]; ok {
+		overrideStatusCode, err = parseRedirectStatusCodeAnnotation(value, ruleName)
+		if err != nil {
+			return envoyroutev3.RedirectAction_FOUND, err
+		}
 	}
 
-	switch *i {
-	case 301:
-		return envoy_config_route_v3.RedirectAction_MOVED_PERMANENTLY
-	case 302:
-		return envoy_config_route_v3.RedirectAction_FOUND
-	case 303:
-		return envoy_config_route_v3.RedirectAction_SEE_OTHER
-	case 307:
-		return envoy_config_route_v3.RedirectAction_TEMPORARY_REDIRECT
-	case 308:
-		return envoy_config_route_v3.RedirectAction_PERMANENT_REDIRECT
-	default:
-		return envoy_config_route_v3.RedirectAction_FOUND
+	if statusCode == nil && overrideStatusCode == nil {
+		return envoyroutev3.RedirectAction_FOUND, nil
+	} else if overrideStatusCode != nil {
+		// if overrideStatusCode is set, it takes precedence over statusCode
+		statusCode = overrideStatusCode
 	}
+
+	switch *statusCode {
+	case 301:
+		return envoyroutev3.RedirectAction_MOVED_PERMANENTLY, nil
+	case 302:
+		return envoyroutev3.RedirectAction_FOUND, nil
+	case 303:
+		return envoyroutev3.RedirectAction_SEE_OTHER, nil
+	case 307:
+		return envoyroutev3.RedirectAction_TEMPORARY_REDIRECT, nil
+	case 308:
+		return envoyroutev3.RedirectAction_PERMANENT_REDIRECT, nil
+	default:
+		return envoyroutev3.RedirectAction_FOUND, fmt.Errorf("invalid redirect status code: %d; %s", *statusCode, httpRedirectStatusCodesAllowedMsg)
+	}
+}
+
+func parseRedirectStatusCodeAnnotation(
+	value string,
+	ruleName *gwv1.SectionName,
+) (*int, error) {
+	if value == "" {
+		return nil, errors.New("missing value")
+	}
+
+	perRuleVal := strings.SplitSeq(value, ",")
+	for v := range perRuleVal {
+		code, err := parseRedirectStatusCode(strings.TrimSpace(v), ruleName)
+		if err != nil {
+			return nil, err
+		}
+		if code != nil {
+			return code, nil
+		}
+	}
+	return nil, nil
+}
+
+func parseRedirectStatusCode(
+	val string,
+	ruleName *gwv1.SectionName,
+) (*int, error) {
+	ruleVals := strings.Split(val, "=")
+
+	var forRule string
+	if len(ruleVals) == 2 {
+		forRule = ruleVals[0]
+		val = strings.TrimSpace(ruleVals[1])
+	}
+
+	if ruleName != nil && forRule != "" && forRule != string(*ruleName) {
+		// The annotation does not apply to this rule specified by ruleName
+		return nil, nil
+	}
+
+	code, err := strconv.Atoi(val)
+	if err != nil {
+		return nil, fmt.Errorf("invalid redirect status code: %s; %s", val, httpRedirectStatusCodesAllowedMsg)
+	}
+
+	return ptr.To(code), nil
 }
 
 // MIRROR IR
 // ===========
 type mirrorIr struct {
 	Cluster         string
-	RuntimeFraction *envoy_config_core_v3.RuntimeFractionalPercent
+	RuntimeFraction *envoycorev3.RuntimeFractionalPercent
 }
 
-func (m *mirrorIr) apply(outputRoute *envoy_config_route_v3.Route) {
-	if outputRoute == nil || outputRoute.GetRoute() == nil {
+func (m *mirrorIr) apply(
+	outputRoute *envoyroutev3.Route,
+	mergeOpts policy.MergeOptions,
+) {
+	if outputRoute == nil || outputRoute.GetRoute() == nil ||
+		!policy.IsSettable(outputRoute.GetRoute().GetRequestMirrorPolicies(), mergeOpts) {
 		return
 	}
-	mirror := &envoy_config_route_v3.RouteAction_RequestMirrorPolicy{
+	mirror := &envoyroutev3.RouteAction_RequestMirrorPolicy{
 		Cluster:         m.Cluster,
 		RuntimeFraction: m.RuntimeFraction,
 	}
@@ -445,12 +554,15 @@ func convertMirrorIR(kctx krt.HandlerContext, f *gwv1.HTTPRequestMirrorFilter, f
 // HEADER MODIFIER IR
 // ==================
 type headerModifierIr struct {
-	Add       []*envoy_config_core_v3.HeaderValueOption
+	Add       []*envoycorev3.HeaderValueOption
 	Remove    []string
 	IsRequest bool // true=request, false=response
 }
 
-func (h *headerModifierIr) apply(outputRoute *envoy_config_route_v3.Route) {
+func (h *headerModifierIr) apply(
+	outputRoute *envoyroutev3.Route,
+	_ policy.MergeOptions,
+) {
 	if outputRoute == nil {
 		return
 	}
@@ -477,23 +589,23 @@ func convertHeaderModifierIR(_ krt.HandlerContext, f *gwv1.HTTPHeaderFilter, isR
 	if f == nil {
 		return nil
 	}
-	var add []*envoy_config_core_v3.HeaderValueOption
+	var add []*envoycorev3.HeaderValueOption
 	for _, h := range f.Add {
-		add = append(add, &envoy_config_core_v3.HeaderValueOption{
-			Header: &envoy_config_core_v3.HeaderValue{
+		add = append(add, &envoycorev3.HeaderValueOption{
+			Header: &envoycorev3.HeaderValue{
 				Key:   string(h.Name),
 				Value: h.Value,
 			},
-			AppendAction: envoy_config_core_v3.HeaderValueOption_APPEND_IF_EXISTS_OR_ADD,
+			AppendAction: envoycorev3.HeaderValueOption_APPEND_IF_EXISTS_OR_ADD,
 		})
 	}
 	for _, h := range f.Set {
-		add = append(add, &envoy_config_core_v3.HeaderValueOption{
-			Header: &envoy_config_core_v3.HeaderValue{
+		add = append(add, &envoycorev3.HeaderValueOption{
+			Header: &envoycorev3.HeaderValue{
 				Key:   string(h.Name),
 				Value: h.Value,
 			},
-			AppendAction: envoy_config_core_v3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+			AppendAction: envoycorev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
 		})
 	}
 	return &headerModifierIr{
@@ -503,11 +615,11 @@ func convertHeaderModifierIR(_ krt.HandlerContext, f *gwv1.HTTPHeaderFilter, isR
 	}
 }
 
-func getFractionPercent(f gwv1.HTTPRequestMirrorFilter) *envoy_config_core_v3.RuntimeFractionalPercent {
+func getFractionPercent(f gwv1.HTTPRequestMirrorFilter) *envoycorev3.RuntimeFractionalPercent {
 	if f.Percent != nil {
-		return &envoy_config_core_v3.RuntimeFractionalPercent{
+		return &envoycorev3.RuntimeFractionalPercent{
 			DefaultValue: &envoytype.FractionalPercent{
-				Numerator:   uint32(*f.Percent),
+				Numerator:   uint32(*f.Percent), //nolint:gosec // G115: percentage values are always non-negative and bounded (0-100)
 				Denominator: envoytype.FractionalPercent_HUNDRED,
 			},
 		}
@@ -518,7 +630,7 @@ func getFractionPercent(f gwv1.HTTPRequestMirrorFilter) *envoy_config_core_v3.Ru
 			denom = float64(*f.Fraction.Denominator)
 		}
 		ratio := float64(f.Fraction.Numerator) / denom
-		return &envoy_config_core_v3.RuntimeFractionalPercent{
+		return &envoycorev3.RuntimeFractionalPercent{
 			DefaultValue: toEnvoyPercentage(ratio),
 		}
 	}
@@ -534,7 +646,7 @@ func toEnvoyPercentage(percentage float64) *envoytype.FractionalPercent {
 	}
 }
 
-func NewGatewayTranslationPass(ctx context.Context, tctx ir.GwTranslationCtx, reporter reports.Reporter) ir.ProxyTranslationPass {
+func NewGatewayTranslationPass(tctx pluginsdkir.GwTranslationCtx, reporter reporter.Reporter) pluginsdkir.ProxyTranslationPass {
 	return &builtinPluginGwPass{
 		reporter:            reporter,
 		hasCorsPolicy:       make(map[string]bool),
@@ -546,24 +658,29 @@ func (p *builtinPlugin) Name() string {
 	return "builtin"
 }
 
-// called one or more times per route rule
-func (p *builtinPluginGwPass) ApplyForRoute(ctx context.Context, pCtx *ir.RouteContext, outputRoute *envoy_config_route_v3.Route) error {
-	policy, ok := pCtx.Policy.(*builtinPlugin)
+// ApplyForRoute may be invoked multiple times on the route, once for each policy since
+// the builtin plugin does not implement MergePolicies.
+// For delegated routes, policies attached to the parent route are inherited
+// and may override the current policy on the output route if pCtx.InheritedPolicyPriority allows it
+// Currently, ApplyForRoute is invoked per policy in order of priority from highest(child route policies)
+// to lowest(parent route policies).
+func (p *builtinPluginGwPass) ApplyForRoute(pCtx *pluginsdkir.RouteContext, outputRoute *envoyroutev3.Route) error {
+	pol, ok := pCtx.Policy.(*builtinPlugin)
 	if !ok {
 		return nil
 	}
 
+	mergeOpts := policy.MergeOptions{
+		Strategy: policy.GetMergeStrategy(pCtx.InheritedPolicyPriority, false),
+	}
+
 	var errs error
-	if policy.filter != nil {
-		policy.filter.apply(outputRoute)
+	if pol.filter != nil {
+		pol.filter.apply(outputRoute, mergeOpts)
 	}
 
-	policy.rule.apply(outputRoute)
-	if outputRoute.GetTypedPerFilterConfig()[statefulSessionFilterName] != nil {
-		p.needStatefulSession[pCtx.FilterChainName] = true
-	}
-
-	if policy.hasCors {
+	p.applyRulePolicy(pCtx, pol.rule, mergeOpts, outputRoute)
+	if pol.hasCors {
 		p.hasCorsPolicy[pCtx.FilterChainName] = true
 	}
 
@@ -571,9 +688,8 @@ func (p *builtinPluginGwPass) ApplyForRoute(ctx context.Context, pCtx *ir.RouteC
 }
 
 func (p *builtinPluginGwPass) ApplyForRouteBackend(
-	ctx context.Context,
-	policy ir.PolicyIR,
-	pCtx *ir.RouteBackendContext,
+	policy pluginsdkir.PolicyIR,
+	pCtx *pluginsdkir.RouteBackendContext,
 ) error {
 	inPolicy, ok := policy.(*builtinPlugin)
 	if !ok {
@@ -600,7 +716,7 @@ func (p *builtinPluginGwPass) ApplyForRouteBackend(
 	return nil
 }
 
-func (p *builtinPluginGwPass) HttpFilters(ctx context.Context, fcc ir.FilterChainCommon) ([]plugins.StagedHttpFilter, error) {
+func (p *builtinPluginGwPass) HttpFilters(fcc pluginsdkir.FilterChainCommon) ([]plugins.StagedHttpFilter, error) {
 	builtinStaged := []plugins.StagedHttpFilter{}
 
 	// If there is a cors policy for route rule or backendRef, add the cors http filter to the chain
@@ -609,6 +725,7 @@ func (p *builtinPluginGwPass) HttpFilters(ctx context.Context, fcc ir.FilterChai
 		if err != nil {
 			return nil, err
 		}
+		stagedFilter.Filter.Disabled = true
 		builtinStaged = append(builtinStaged, stagedFilter)
 	}
 
@@ -624,8 +741,17 @@ func (p *builtinPluginGwPass) HttpFilters(ctx context.Context, fcc ir.FilterChai
 	return builtinStaged, nil
 }
 
-// New helper to create filterIr
-func convertFilterIr(kctx krt.HandlerContext, f gwv1.HTTPRouteFilter, fromgk schema.GroupKind, fromns string, refgrants *RefGrantIndex, ups *BackendIndex) *filterIr {
+// New helper to create filterIR
+func convertfilterIR(
+	kctx krt.HandlerContext,
+	f gwv1.HTTPRouteFilter,
+	fromgk schema.GroupKind,
+	fromns string,
+	refgrants *RefGrantIndex,
+	ups *BackendIndex,
+	ruleName *gwv1.SectionName,
+	annotations map[string]string,
+) (*filterIR, error) {
 	var policy applyToRoute
 	switch f.Type {
 	case gwv1.HTTPRouteFilterRequestMirror:
@@ -644,7 +770,10 @@ func convertFilterIr(kctx krt.HandlerContext, f gwv1.HTTPRouteFilter, fromgk sch
 			policy = hm
 		}
 	case gwv1.HTTPRouteFilterRequestRedirect:
-		rr := convertRequestRedirectIR(kctx, f.RequestRedirect)
+		rr, err := convertRequestRedirectIR(kctx, f.RequestRedirect, ruleName, annotations)
+		if err != nil {
+			return nil, err
+		}
 		if rr != nil {
 			policy = rr
 		}
@@ -660,68 +789,87 @@ func convertFilterIr(kctx krt.HandlerContext, f gwv1.HTTPRouteFilter, fromgk sch
 		}
 	}
 	if policy == nil {
-		return nil
+		return nil, nil
 	}
-	return &filterIr{
+	return &filterIR{
 		filterType: f.Type,
 		policy:     policy,
-	}
+	}, nil
 }
 
 // REQUEST REDIRECT IR
 // ===================
 type requestRedirectIr struct {
-	Redir *envoy_config_route_v3.RedirectAction
+	Redir *envoyroutev3.RedirectAction
 }
 
-func (r *requestRedirectIr) apply(outputRoute *envoy_config_route_v3.Route) {
-	if outputRoute == nil {
+func (r *requestRedirectIr) apply(
+	outputRoute *envoyroutev3.Route,
+	mergeOpts policy.MergeOptions,
+) {
+	if outputRoute == nil || !policy.IsSettable(outputRoute.GetRedirect(), mergeOpts) {
 		return
 	}
-	outputRoute.Action = &envoy_config_route_v3.Route_Redirect{
+	outputRoute.Action = &envoyroutev3.Route_Redirect{
 		Redirect: r.Redir,
 	}
 }
 
-func convertRequestRedirectIR(_ krt.HandlerContext, config *gwv1.HTTPRequestRedirectFilter) *requestRedirectIr {
+func convertRequestRedirectIR(
+	_ krt.HandlerContext,
+	config *gwv1.HTTPRequestRedirectFilter,
+	ruleName *gwv1.SectionName,
+	annotations map[string]string,
+) (*requestRedirectIr, error) {
 	if config == nil {
-		return nil
+		return nil, nil
 	}
-	redir := &envoy_config_route_v3.RedirectAction{
+
+	statusCode, err := translateStatusCode(config.StatusCode, ruleName, annotations)
+	if err != nil {
+		return nil, err
+	}
+	redir := &envoyroutev3.RedirectAction{
 		HostRedirect: translateHostname(config.Hostname),
-		ResponseCode: translateStatusCode(config.StatusCode),
+		ResponseCode: statusCode,
 		PortRedirect: translatePort(config.Port),
 	}
 	translateScheme(redir, config.Scheme)
 	translatePathRewrite(redir, config.Path)
-	return &requestRedirectIr{Redir: redir}
+	return &requestRedirectIr{Redir: redir}, nil
 }
 
 // URL REWRITE IR
 // ==============
 type urlRewriteIr struct {
-	HostRewrite   *envoy_config_route_v3.RouteAction_HostRewriteLiteral
+	HostRewrite   *envoyroutev3.RouteAction_HostRewriteLiteral
 	FullReplace   string
 	PrefixReplace string
 }
 
-func (u *urlRewriteIr) apply(outputRoute *envoy_config_route_v3.Route) {
+func (u *urlRewriteIr) apply(
+	outputRoute *envoyroutev3.Route,
+	mergeOpts policy.MergeOptions,
+) {
 	if outputRoute == nil || outputRoute.GetRoute() == nil {
 		return
 	}
-	if u.HostRewrite != nil {
+
+	if u.HostRewrite != nil && policy.IsSettable(outputRoute.GetRoute().GetHostRewriteSpecifier(), mergeOpts) {
 		outputRoute.GetRoute().HostRewriteSpecifier = u.HostRewrite
 	}
-	if u.FullReplace != "" {
+	if u.FullReplace != "" && isPathRewriteSettable(outputRoute, mergeOpts) {
 		outputRoute.GetRoute().RegexRewrite = &envoy_type_matcher_v3.RegexMatchAndSubstitute{
 			Pattern: &envoy_type_matcher_v3.RegexMatcher{
-				EngineType: &envoy_type_matcher_v3.RegexMatcher_GoogleRe2{GoogleRe2: &envoy_type_matcher_v3.RegexMatcher_GoogleRE2{}},
-				Regex:      ".*",
+				Regex: ".*",
 			},
 			Substitution: u.FullReplace,
 		}
 	}
-	if u.PrefixReplace != "" {
+
+	// need to check that both RegexRewrite and PrefixRewrite are settable
+	// cannot set both RegexRewrite and PrefixRewrite; Envoy will reject it
+	if u.PrefixReplace != "" && isPathRewriteSettable(outputRoute, mergeOpts) {
 		path := outputRoute.GetMatch().GetPrefix()
 		if path == "" {
 			path = outputRoute.GetMatch().GetPath()
@@ -729,27 +877,43 @@ func (u *urlRewriteIr) apply(outputRoute *envoy_config_route_v3.Route) {
 		if path == "" {
 			path = outputRoute.GetMatch().GetPathSeparatedPrefix()
 		}
+
 		if path != "" && u.PrefixReplace == "/" {
+			if outputRoute.GetRoute().GetPrefixRewrite() != "" {
+				// clear the PrefixRewrite in order to override it with the RegexRewrite
+				outputRoute.GetRoute().PrefixRewrite = ""
+				logger.Debug("overriding PrefixRewrite with RegexRewrite", "path", path, "prefixReplace", u.PrefixReplace)
+			}
 			outputRoute.GetRoute().RegexRewrite = &envoy_type_matcher_v3.RegexMatchAndSubstitute{
 				Pattern: &envoy_type_matcher_v3.RegexMatcher{
-					EngineType: &envoy_type_matcher_v3.RegexMatcher_GoogleRe2{GoogleRe2: &envoy_type_matcher_v3.RegexMatcher_GoogleRE2{}},
-					Regex:      "^" + path + "\\/*",
+					Regex: "^" + path + "\\/*",
 				},
 				Substitution: "/",
 			}
 		} else {
+			if outputRoute.GetRoute().GetRegexRewrite() != nil {
+				// clear the RegexRewrite in order to override it with the PrefixRewrite
+				outputRoute.GetRoute().RegexRewrite = nil
+				logger.Debug("overriding RegexRewrite with PrefixRewrite", "path", path, "prefixReplace", u.PrefixReplace)
+			}
 			outputRoute.GetRoute().PrefixRewrite = u.PrefixReplace
 		}
 	}
+}
+
+// isPathRewriteSettable returns true if both RegexRewrite and PrefixRewrite are settable
+func isPathRewriteSettable(route *envoyroutev3.Route, mergeOpts policy.MergeOptions) bool {
+	return policy.IsSettable(route.GetRoute().GetRegexRewrite(), mergeOpts) &&
+		policy.IsSettable(route.GetRoute().GetPrefixRewrite(), mergeOpts)
 }
 
 func convertURLRewriteIR(_ krt.HandlerContext, config *gwv1.HTTPURLRewriteFilter) *urlRewriteIr {
 	if config == nil {
 		return nil
 	}
-	var hostrewrite *envoy_config_route_v3.RouteAction_HostRewriteLiteral
+	var hostrewrite *envoyroutev3.RouteAction_HostRewriteLiteral
 	if config.Hostname != nil {
-		hostrewrite = &envoy_config_route_v3.RouteAction_HostRewriteLiteral{
+		hostrewrite = &envoyroutev3.RouteAction_HostRewriteLiteral{
 			HostRewriteLiteral: string(*config.Hostname),
 		}
 	}
@@ -776,8 +940,11 @@ type corsIr struct {
 	Cors *anypb.Any
 }
 
-func (c *corsIr) apply(outputRoute *envoy_config_route_v3.Route) {
-	if c.Cors == nil {
+func (c *corsIr) apply(
+	outputRoute *envoyroutev3.Route,
+	mergeOpts policy.MergeOptions,
+) {
+	if c.Cors == nil || !policy.IsSettable(outputRoute.GetTypedPerFilterConfig()[envoy_wellknown.CORS], mergeOpts) {
 		return
 	}
 
@@ -798,7 +965,7 @@ func convertCORSIR(_ krt.HandlerContext, f *gwv1.HTTPCORSFilter) *corsIr {
 	if f == nil {
 		return nil
 	}
-	corsPolicyAny, err := utils.MessageToAny(utils.ToEnvoyCorsPolicy(f))
+	corsPolicyAny, err := utils.MessageToAny(policy.BuildCorsPolicy(f, false))
 	if err != nil {
 		// this should never happen.
 		logger.Error("failed to convert CORS policy to Any", "error", err)

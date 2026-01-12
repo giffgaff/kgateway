@@ -13,13 +13,14 @@ import (
 	"istio.io/istio/pkg/kube/kubetypes"
 	"istio.io/istio/pkg/slices"
 
-	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/extensions2/common"
-	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/ir"
-	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/krtcollections"
-
 	networking "istio.io/api/networking/v1alpha3"
 	networkingclient "istio.io/client-go/pkg/apis/networking/v1"
 	"istio.io/istio/pkg/maps"
+
+	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/ir"
+	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/krtcollections"
+	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/collections"
+	krtpkg "github.com/kgateway-dev/kgateway/v2/pkg/utils/krtutil"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -65,7 +66,7 @@ func (s seSelector) Equals(in seSelector) bool {
 	return metaEqual && proto.Equal(&s.ServiceEntry.Spec, &in.ServiceEntry.Spec)
 }
 
-// selectedWorkload adds the following to LocalityPod:
+// selectedWorkload adds the following to Pods:
 // * fields specific to workload entry (portMapping, network, weight)
 // * selectedBy pointers to the selecting ServiceEntries
 // Usable with FilterSelect
@@ -88,7 +89,7 @@ func (sw selectedWorkload) mapPort(name string, defalutValue int32) int32 {
 		return defalutValue
 	}
 	if override := sw.portMapping[name]; override > 0 {
-		return int32(override)
+		return int32(override) //nolint:gosec // G115: port numbers are always in valid range (1-65535)
 	}
 	return defalutValue
 }
@@ -118,7 +119,7 @@ type serviceEntryPlugin struct {
 }
 
 func initServiceEntryCollections(
-	commonCols *common.CommonCollections,
+	commonCols *collections.CommonCollections,
 	opts Options,
 ) serviceEntryPlugin {
 	// setup input collections
@@ -137,7 +138,7 @@ func initServiceEntryCollections(
 	SelectedWorkloads, selectedWorkloadsIndex := selectedWorkloads(
 		SelectingServiceEntries,
 		WorkloadEntries,
-		commonCols.Pods,
+		commonCols.LocalityPods,
 		opts.Aliaser,
 	)
 
@@ -185,7 +186,7 @@ func selectedWorkloads(
 	krt.Collection[selectedWorkload],
 	krt.Index[string, selectedWorkload],
 ) {
-	seNsIndex := krt.NewIndex(ServiceEntries, func(o seSelector) []string {
+	seNsIndex := krtpkg.UnnamedIndex(ServiceEntries, func(o seSelector) []string {
 		namespaces := sets.New(o.GetNamespace())
 		if aliaser != nil {
 			for _, alias := range aliaser(o.ServiceEntry) {
@@ -197,7 +198,7 @@ func selectedWorkloads(
 		return namespaces.UnsortedList()
 	})
 
-	// WorkloadEntries: selection logic and conver to LocalityPod
+	// WorkloadEntries: selection logic and convert to Pod
 	selectedWorkloadEntries := krt.NewCollection(WorkloadEntries, func(ctx krt.HandlerContext, we *networkingclient.WorkloadEntry) *selectedWorkload {
 		// find all the SEs that select this we
 		// if there are none, we can stop early
@@ -243,7 +244,7 @@ func selectedWorkloads(
 
 	// consolidate Pods and WorkloadEntries
 	allWorkloads := krt.JoinCollection([]krt.Collection[selectedWorkload]{selectedPods, selectedWorkloadEntries}, krt.WithName("ServiceEntrySelectWorkloads"))
-	workloadsByServiceEntry := krt.NewIndex(allWorkloads, func(o selectedWorkload) []string {
+	workloadsByServiceEntry := krtpkg.UnnamedIndex(allWorkloads, func(o selectedWorkload) []string {
 		return slices.Map(o.selectedBy, func(n krt.Named) string {
 			return n.ResourceName()
 		})

@@ -15,28 +15,21 @@ import (
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
-	gwv1a2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
-	gwv1a3 "sigs.k8s.io/gateway-api/apis/v1alpha3"
 
+	"github.com/kgateway-dev/kgateway/v2/api/v1alpha1"
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/extensions2/plugins/backendtlspolicy"
 	reports "github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/reporter"
-	"github.com/kgateway-dev/kgateway/v2/test/gomega/matchers"
-	"github.com/kgateway-dev/kgateway/v2/test/helpers"
-	"github.com/kgateway-dev/kgateway/v2/test/kubernetes/e2e/defaults"
-
 	"github.com/kgateway-dev/kgateway/v2/pkg/utils/fsutils"
 	"github.com/kgateway-dev/kgateway/v2/pkg/utils/kubeutils"
 	"github.com/kgateway-dev/kgateway/v2/pkg/utils/requestutils/curl"
+	"github.com/kgateway-dev/kgateway/v2/test/gomega/matchers"
+	"github.com/kgateway-dev/kgateway/v2/test/helpers"
 	"github.com/kgateway-dev/kgateway/v2/test/kubernetes/e2e"
+	"github.com/kgateway-dev/kgateway/v2/test/kubernetes/e2e/defaults"
 )
 
 var (
-	baseManifests = []string{
-		filepath.Join(fsutils.MustGetThisDir(), "inputs/base.yaml"),
-		filepath.Join(fsutils.MustGetThisDir(), "inputs/nginx.yaml"),
-		defaults.CurlPodManifest,
-	}
-	configMapManifest = filepath.Join(fsutils.MustGetThisDir(), "inputs/configmap.yaml")
+	configMapManifest = filepath.Join(fsutils.MustGetThisDir(), "testdata/configmap.yaml")
 
 	proxyObjMeta = metav1.ObjectMeta{
 		Name:      "gw",
@@ -44,7 +37,7 @@ var (
 	}
 	proxyDeployment  = &appsv1.Deployment{ObjectMeta: proxyObjMeta}
 	proxyService     = &corev1.Service{ObjectMeta: proxyObjMeta}
-	backendTlsPolicy = &gwv1a3.BackendTLSPolicy{
+	backendTlsPolicy = &gwv1.BackendTLSPolicy{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "tls-policy",
 			Namespace: "default",
@@ -68,31 +61,49 @@ var (
 	svcKind  = "Service"
 )
 
-var _ e2e.NewSuiteFunc = NewTestingSuite
-
-type clientTlsTestingSuite struct {
+type tsuite struct {
 	suite.Suite
 	ctx              context.Context
 	testInstallation *e2e.TestInstallation
+	baseManifests    []string
+	agentgateway     bool
 }
 
 func NewTestingSuite(ctx context.Context, testInst *e2e.TestInstallation) suite.TestingSuite {
-	return &clientTlsTestingSuite{
+	return &tsuite{
 		ctx:              ctx,
 		testInstallation: testInst,
+		baseManifests: []string{
+			filepath.Join(fsutils.MustGetThisDir(), "testdata/base.yaml"),
+			filepath.Join(fsutils.MustGetThisDir(), "testdata/nginx.yaml"),
+			defaults.CurlPodManifest,
+		},
 	}
 }
 
-func (s *clientTlsTestingSuite) TestBackendTLSPolicyAndStatus() {
+func NewAgentgatewayTestingSuite(ctx context.Context, testInst *e2e.TestInstallation) suite.TestingSuite {
+	return &tsuite{
+		ctx:              ctx,
+		testInstallation: testInst,
+		agentgateway:     true,
+		baseManifests: []string{
+			filepath.Join(fsutils.MustGetThisDir(), "testdata/base-agw.yaml"),
+			filepath.Join(fsutils.MustGetThisDir(), "testdata/nginx.yaml"),
+			defaults.CurlPodManifest,
+		},
+	}
+}
+
+func (s *tsuite) TestBackendTLSPolicyAndStatus() {
 	s.T().Cleanup(func() {
-		for _, manifest := range baseManifests {
+		for _, manifest := range s.baseManifests {
 			err := s.testInstallation.Actions.Kubectl().DeleteFileSafe(s.ctx, manifest)
 			s.Require().NoError(err)
 		}
 		s.testInstallation.Assertions.EventuallyObjectsNotExist(s.ctx, proxyService, proxyDeployment, backendTlsPolicy)
 	})
 
-	toCreate := append(baseManifests, configMapManifest)
+	toCreate := append(s.baseManifests, configMapManifest)
 	for _, manifest := range toCreate {
 		err := s.testInstallation.Actions.Kubectl().ApplyFile(s.ctx, manifest)
 		s.Require().NoError(err)
@@ -153,11 +164,23 @@ func (s *clientTlsTestingSuite) TestBackendTLSPolicyAndStatus() {
 		},
 	)
 
+	if s.agentgateway {
+		// Agentgateway currently doesn't support Statuses for BackendTLSPolicy
+		s.T().Log("Skipping status assertions for Agentgateway as they are not currently supported")
+		return
+	}
 	s.assertPolicyStatus(metav1.Condition{
-		Type:               string(gwv1a2.PolicyConditionAccepted),
+		Type:               string(v1alpha1.PolicyConditionAccepted),
 		Status:             metav1.ConditionTrue,
-		Reason:             string(gwv1a2.PolicyReasonAccepted),
-		Message:            reports.PolicyAcceptedAndAttachedMsg,
+		Reason:             string(v1alpha1.PolicyReasonValid),
+		Message:            reports.PolicyAcceptedMsg,
+		ObservedGeneration: backendTlsPolicy.Generation,
+	})
+	s.assertPolicyStatus(metav1.Condition{
+		Type:               string(v1alpha1.PolicyConditionAttached),
+		Status:             metav1.ConditionTrue,
+		Reason:             string(v1alpha1.PolicyReasonAttached),
+		Message:            reports.PolicyAttachedMsg,
 		ObservedGeneration: backendTlsPolicy.Generation,
 	})
 
@@ -166,26 +189,26 @@ func (s *clientTlsTestingSuite) TestBackendTLSPolicyAndStatus() {
 	s.Require().NoError(err)
 
 	s.assertPolicyStatus(metav1.Condition{
-		Type:               string(gwv1a2.PolicyConditionAccepted),
+		Type:               string(gwv1.PolicyConditionAccepted),
 		Status:             metav1.ConditionFalse,
-		Reason:             string(gwv1a2.PolicyReasonInvalid),
+		Reason:             string(gwv1.PolicyReasonInvalid),
 		Message:            fmt.Sprintf("%s: default/ca", backendtlspolicy.ErrConfigMapNotFound),
 		ObservedGeneration: backendTlsPolicy.Generation,
 	})
 }
 
-func (s *clientTlsTestingSuite) assertPolicyStatus(inCondition metav1.Condition) {
+func (s *tsuite) assertPolicyStatus(inCondition metav1.Condition) {
 	currentTimeout, pollingInterval := helpers.GetTimeouts()
 	p := s.testInstallation.Assertions
 	p.Gomega.Eventually(func(g gomega.Gomega) {
-		tlsPol := &gwv1a3.BackendTLSPolicy{}
+		tlsPol := &gwv1.BackendTLSPolicy{}
 		objKey := client.ObjectKeyFromObject(backendTlsPolicy)
 		err := s.testInstallation.ClusterContext.Client.Get(s.ctx, objKey, tlsPol)
 		g.Expect(err).NotTo(gomega.HaveOccurred(), "failed to get BackendTLSPolicy %s", objKey)
 
 		g.Expect(tlsPol.Status.Ancestors).To(gomega.HaveLen(2), "ancestors didn't have length of 2")
 
-		expectedAncestorRefs := []gwv1a2.ParentReference{
+		expectedAncestorRefs := []gwv1.ParentReference{
 			{
 				Group:     (*gwv1.Group)(&svcGroup),
 				Kind:      (*gwv1.Kind)(&svcKind),
@@ -204,7 +227,7 @@ func (s *clientTlsTestingSuite) assertPolicyStatus(inCondition metav1.Condition)
 			expectedRef := expectedAncestorRefs[i]
 			g.Expect(ancestor.AncestorRef).To(gomega.BeEquivalentTo(expectedRef))
 
-			g.Expect(ancestor.Conditions).To(gomega.HaveLen(1), "ancestors conditions wasn't length of 1")
+			g.Expect(ancestor.Conditions).To(gomega.HaveLen(2), "ancestors conditions wasn't length of 2")
 			cond := meta.FindStatusCondition(ancestor.Conditions, inCondition.Type)
 			g.Expect(cond).NotTo(gomega.BeNil(), "policy should have accepted condition")
 			g.Expect(cond.Status).To(gomega.Equal(inCondition.Status), "policy accepted condition should be true")

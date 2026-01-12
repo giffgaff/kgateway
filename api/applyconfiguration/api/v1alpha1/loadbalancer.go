@@ -11,15 +11,14 @@ import (
 // LoadBalancerApplyConfiguration represents a declarative configuration of the LoadBalancer type for use
 // with apply.
 type LoadBalancerApplyConfiguration struct {
-	HealthyPanicThreshold           *uint32                                           `json:"healthyPanicThreshold,omitempty"`
+	HealthyPanicThreshold           *int32                                            `json:"healthyPanicThreshold,omitempty"`
 	UpdateMergeWindow               *v1.Duration                                      `json:"updateMergeWindow,omitempty"`
 	LeastRequest                    *LoadBalancerLeastRequestConfigApplyConfiguration `json:"leastRequest,omitempty"`
 	RoundRobin                      *LoadBalancerRoundRobinConfigApplyConfiguration   `json:"roundRobin,omitempty"`
 	RingHash                        *LoadBalancerRingHashConfigApplyConfiguration     `json:"ringHash,omitempty"`
-	Maglev                          *apiv1alpha1.LoadBalancerMaglevConfig             `json:"maglev,omitempty"`
+	Maglev                          *LoadBalancerMaglevConfigApplyConfiguration       `json:"maglev,omitempty"`
 	Random                          *apiv1alpha1.LoadBalancerRandomConfig             `json:"random,omitempty"`
 	LocalityType                    *apiv1alpha1.LocalityType                         `json:"localityType,omitempty"`
-	UseHostnameForHashing           *bool                                             `json:"useHostnameForHashing,omitempty"`
 	CloseConnectionsOnHostSetChange *bool                                             `json:"closeConnectionsOnHostSetChange,omitempty"`
 }
 
@@ -32,7 +31,7 @@ func LoadBalancer() *LoadBalancerApplyConfiguration {
 // WithHealthyPanicThreshold sets the HealthyPanicThreshold field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the HealthyPanicThreshold field is set to the value of the last call.
-func (b *LoadBalancerApplyConfiguration) WithHealthyPanicThreshold(value uint32) *LoadBalancerApplyConfiguration {
+func (b *LoadBalancerApplyConfiguration) WithHealthyPanicThreshold(value int32) *LoadBalancerApplyConfiguration {
 	b.HealthyPanicThreshold = &value
 	return b
 }
@@ -72,8 +71,8 @@ func (b *LoadBalancerApplyConfiguration) WithRingHash(value *LoadBalancerRingHas
 // WithMaglev sets the Maglev field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the Maglev field is set to the value of the last call.
-func (b *LoadBalancerApplyConfiguration) WithMaglev(value apiv1alpha1.LoadBalancerMaglevConfig) *LoadBalancerApplyConfiguration {
-	b.Maglev = &value
+func (b *LoadBalancerApplyConfiguration) WithMaglev(value *LoadBalancerMaglevConfigApplyConfiguration) *LoadBalancerApplyConfiguration {
+	b.Maglev = value
 	return b
 }
 
@@ -90,14 +89,6 @@ func (b *LoadBalancerApplyConfiguration) WithRandom(value apiv1alpha1.LoadBalanc
 // If called multiple times, the LocalityType field is set to the value of the last call.
 func (b *LoadBalancerApplyConfiguration) WithLocalityType(value apiv1alpha1.LocalityType) *LoadBalancerApplyConfiguration {
 	b.LocalityType = &value
-	return b
-}
-
-// WithUseHostnameForHashing sets the UseHostnameForHashing field in the declarative configuration to the given value
-// and returns the receiver, so that objects can be built by chaining "With" function invocations.
-// If called multiple times, the UseHostnameForHashing field is set to the value of the last call.
-func (b *LoadBalancerApplyConfiguration) WithUseHostnameForHashing(value bool) *LoadBalancerApplyConfiguration {
-	b.UseHostnameForHashing = &value
 	return b
 }
 
